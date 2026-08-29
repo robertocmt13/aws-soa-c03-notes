@@ -33,6 +33,21 @@ facturación, están anotadas explícitamente: en un entorno de laboratorio es f
 dejarse recursos encendidos y en producción es fácil disparar el coste de
 métricas personalizadas sin darse cuenta.
 
+## Fuentes y método
+
+El contenido de estas notas procede de dos fuentes:
+
+- El curso **AWS Certified CloudOps Engineer Associate SOA-C03 2026** de
+  [Stéphane Maarek](https://www.udemy.com/user/stephane-maarek/) en Udemy.
+- Conversaciones con **Claude** (Anthropic), usado como herramienta de estudio para
+  profundizar en los conceptos, resolver dudas y contrastar los detalles prácticos
+  y de facturación que no siempre aparecen en el material del curso.
+
+La redacción final de los `README` se ha apoyado en esas conversaciones. Los
+ejemplos, analogías y el enfoque de cada nota responden a las dudas concretas que
+me fueron surgiendo durante el estudio y a mi experiencia previa administrando
+infraestructura en producción.
+
 ---
 
 Roberto Carlos Moyano Torres

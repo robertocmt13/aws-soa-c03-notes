@@ -15,6 +15,7 @@ qué no, y cómo se relaciona con lo que ya venía haciendo en producción.
 | [EC2 Monitoring](./ec2-monitoring/) | CloudWatch Agent, plugin procstat, métricas no incluidas por defecto y su coste |
 | [Placement Groups](./placement-groups/) | Estrategias cluster / spread / partition y cuándo usar cada una |
 | [EC2 Instance Connect](./ec2-instance-connect/) | Acceso SSH con credenciales temporales y acceso a instancias sin IP pública |
+| [Status Checks y recuperación](./ec2-status-checks-recovery/) | Los tres checks, reboot vs stop/start y automatización de la recuperación con alarmas |
 
 ## Contexto
 

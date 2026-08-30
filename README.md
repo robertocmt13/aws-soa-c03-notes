@@ -17,6 +17,7 @@ qué no, y cómo se relaciona con lo que ya venía haciendo en producción.
 | [EC2 Instance Connect](./ec2-instance-connect/) | Acceso SSH con credenciales temporales y acceso a instancias sin IP pública |
 | [Status Checks y recuperación](./ec2-status-checks-recovery/) | Los tres checks, reboot vs stop/start y automatización de la recuperación con alarmas |
 | [IAM: configuración inicial](./iam-initial-setup/) | Usuario administrador, MFA y alias de cuenta *(práctica propia, fuera del curso)* |
+| [EC2 Hibernate](./ec2-hibernate/) | Conservación del estado de RAM, requisitos y comparativa con reboot y stop/start |
 
 ## Contexto
 

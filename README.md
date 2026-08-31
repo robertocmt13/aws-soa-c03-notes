@@ -18,6 +18,7 @@ qué no, y cómo se relaciona con lo que ya venía haciendo en producción.
 | [Status Checks y recuperación](./ec2-status-checks-recovery/) | Los tres checks, reboot vs stop/start y automatización de la recuperación con alarmas |
 | [IAM: configuración inicial](./iam-initial-setup/) | Usuario administrador, MFA y alias de cuenta *(práctica propia, fuera del curso)* |
 | [EC2 Hibernate](./ec2-hibernate/) | Conservación del estado de RAM, requisitos y comparativa con reboot y stop/start |
+| [04 - AMI](./04-ami/) | AMI, no reboot, migración entre regiones y AZs, cross-account sharing y copy, EC2 Image Builder, AMI in production |
 
 ## Contexto
 

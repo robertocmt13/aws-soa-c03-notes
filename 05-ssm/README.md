@@ -2,7 +2,7 @@
 
 Notas de la Sección 5 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en progreso. Cubierto hasta ahora: lecciones 31 a 34.
+> Sección en progreso. Cubierto hasta ahora: lecciones 31 a 37.
 
 ---
 
@@ -209,6 +209,186 @@ Avisos que aparecen en la consola y que no están en el vídeo:
 
 ---
 
+## SSM Automation
+
+Simplifica tareas comunes de mantenimiento y despliegue **sobre instancias EC2 y otros
+recursos de AWS**: reiniciar instancias, crear una AMI, hacer un snapshot de EBS.
+
+### Diferencia clave con Run Command
+
+Esta distinción es la base para elegir la herramienta correcta:
+
+| | Run Command | Automation |
+|---|---|---|
+| Dónde ejecuta | **Dentro del SO** de la instancia, vía el agente | **Llamadas a la API de AWS**, desde fuera |
+| Sobre qué actúa | Instancias con SSM Agent | EC2, EBS, AMIs, RDS, S3… cualquier recurso |
+| Ejemplo de paso | `sudo yum install httpd` | `aws:executeAwsApi` → `EC2: CreateSnapshot` |
+
+Las dos se combinan: una automatización puede llamar a Run Command como uno de sus pasos
+cuando necesita hacer algo dentro del sistema operativo.
+
+### Automation Runbook
+
+Un runbook es un **documento SSM de tipo Automation** que define las acciones a realizar.
+AWS trae **runbooks predefinidos**, y también se pueden crear propios.
+
+La consola muestra el runbook como un **árbol de pasos** con sus rutas de fallo. Ejemplo real:
+`AWS-QuarantineEC2Instance` encadena `GetEC2InstanceResources` → `PrepareQuarantineEC2Instance`
+→ `createSnapshot` → `verifySnapshot` → `ModifyInstanceAttribute`, con un camino `On failure`
+desde cada paso hacia el final.
+
+Están organizados por categorías: Remediation, Patching, Security, Instance management, Data
+backup, AMI management, Resource management, Cost management…
+
+### Cómo se dispara
+
+Cuatro formas:
+
+1. **Manualmente** desde la consola, la CLI o el SDK
+2. **Amazon EventBridge** (por evento o programado)
+3. **Maintenance Windows** (en la ventana de mantenimiento)
+4. **AWS Config**, para remediación de reglas
+
+La cuarta es la que más cae en el examen. El patrón es:
+
+> **IAM previene** (rechaza la llamada a la API y el recurso nunca se crea).
+> **Config detecta** (evalúa por cambio de configuración o periódicamente cada 1/3/6/12/24 h).
+> **Automation remedia** (ejecuta el runbook que corrige el recurso no conforme).
+
+Config es reactivo, no preventivo: **el recurso llega a existir** y se corrige después. Siempre
+hay una ventana de exposición, corta pero real. Por eso las tres capas se usan juntas.
+
+### Opciones de ejecución
+
+- **Simple execution** — sobre unos objetivos concretos
+- **Rate control** — concurrencia y umbrales de error, igual que en Run Command
+- **Multi-account and Region** — ejecutar en varias cuentas y regiones a la vez
+- **Manual execution** — paso a paso, para depurar
+
+Los objetivos pueden seleccionarse también por **resource group**.
+
+Algunos runbooks incluyen **pasos de aprobación**: la automatización se detiene y espera
+autorización humana antes de continuar (por ejemplo
+`AWS-RestartEC2InstanceWithApproval`). Junto con los umbrales de error, es lo que hace la
+herramienta usable en producción.
+
+### Caso de uso: Patch AMI & Update ASG
+
+Flujo completo orquestado por Automation, y ejemplo canónico de **infraestructura inmutable**:
+
+1. Lanzar una instancia desde la **Source AMI**
+2. **Run Command** con `AWS-RunPatchBaseline` instala los parches
+3. Parar la instancia
+4. Crear la imagen → **Patched AMI**
+5. Terminar la instancia
+6. Ejecutar un script Python
+7. El script **actualiza el Launch Template** para que apunte a la nueva AMI
+8. **Instance refresh** en el Auto Scaling Group
+
+El punto que hay que entender: **los parches no se aplican a las instancias existentes**. El
+instance refresh va terminando las máquinas viejas y lanzando nuevas desde el launch template
+actualizado. No se parchea el servidor, se sustituye.
+
+> Aviso de coste: replicar este flujo lanza instancias EC2 reales. El servicio Automation es
+> gratuito, pero las instancias que orquesta no.
+
+---
+
+## SSM Parameter Store
+
+Almacenamiento seguro y centralizado de **configuración y secretos**.
+
+- **Cifrado opcional** con KMS, transparente para la aplicación
+- **Serverless**, escalable, duradero, SDK sencillo
+- **Versionado** de configuraciones y secretos
+- Control de acceso mediante **IAM**
+- **Notificaciones** con EventBridge
+- **Integración con CloudFormation**
+
+La idea, comparada con un fichero `.env`: el `.env` vive en el disco de cada servidor, así que
+cambiar una contraseña obliga a tocar todas las máquinas. Con Parameter Store el valor está en
+un único sitio, la aplicación lo pide cuando lo necesita, y además se gana versionado, cifrado
+y permisos por IAM en lugar de "quien tenga acceso al disco, lo lee".
+
+El flujo de lectura de un valor cifrado: la aplicación pide el parámetro → SSM **comprueba los
+permisos IAM** → si tiene acceso a la clave KMS, se descifra y se devuelve.
+
+### Jerarquía
+
+Los parámetros se organizan por rutas:
+
+```
+/mi-departamento/
+  mi-app/
+    dev/
+      db-url
+      db-password
+    prod/
+      db-url
+      db-password
+```
+
+Esto permite dos cosas importantes:
+
+- Recuperar toda una rama de golpe con **`GetParametersByPath`** (o valores sueltos con
+  `GetParameters`).
+- Dar **permisos IAM por prefijo**: que un rol solo pueda leer `/mi-app/dev/*` y no toque
+  producción.
+
+### Rutas especiales
+
+**`/aws/service/ami-amazon-linux-latest/...`** — parámetros **públicos** mantenidos por AWS que
+siempre contienen el ID de la última AMI de Amazon Linux en esa región. Evitan hardcodear IDs
+de AMI, que son regionales y quedan obsoletos:
+
+```yaml
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+```
+
+La misma plantilla vale para cualquier región y siempre lanza la imagen actualizada.
+
+**`/aws/reference/secretsmanager/<secret_id>`** — permite leer un secreto de **Secrets
+Manager** usando la API de Parameter Store. Sirve para tener un único flujo de lectura de
+configuración en el código, vengan los valores de donde vengan.
+
+### Tiers: Standard vs Advanced
+
+| | Standard | Advanced |
+|---|---|---|
+| Nº de parámetros (por cuenta y región) | 10.000 | 100.000 |
+| Tamaño máximo del valor | 4 KB | 8 KB |
+| Parameter policies | No | **Sí** |
+| Coste | Sin cargo | **0,05 USD por parámetro y mes** |
+
+### Parameter Policies (solo tier advanced)
+
+Permiten asignar un **TTL** a un parámetro para forzar la actualización o el borrado de datos
+sensibles como contraseñas. Se pueden aplicar varias políticas a la vez.
+
+| Política | Qué hace |
+|---|---|
+| `Expiration` | Borra el parámetro en una fecha concreta |
+| `ExpirationNotification` | Avisa vía EventBridge N días **antes** de que expire |
+| `NoChangeNotification` | Avisa vía EventBridge si el parámetro lleva N días sin cambiar |
+
+El caso de uso típico es forzar la rotación de credenciales.
+
+### Parameter Store vs Secrets Manager
+
+| | Parameter Store | Secrets Manager |
+|---|---|---|
+| Coste | Gratis en tier estándar | Por secreto |
+| Rotación automática | No | **Sí**, integrada con RDS |
+| Uso típico | Configuración y secretos sencillos | Credenciales que deben rotar |
+
+> Si el enunciado menciona **rotación automática de credenciales de base de datos**, la
+> respuesta es **Secrets Manager**.
+
+---
+
 ## Limpieza
 
 | Recurso | ¿Factura? | Nota |
@@ -237,3 +417,11 @@ Avisos que aparecen en la consola y que no están en el vídeo:
 | Objetivos de Run Command | Por tags, manualmente, o por resource group |
 | Salida de Run Command | Consola, S3 o CloudWatch Logs. Notificaciones vía SNS |
 | Invocación automática | EventBridge |
+| Run Command vs Automation | Dentro del SO vs llamadas a la API de AWS |
+| Disparadores de Automation | Consola/CLI/SDK, EventBridge, Maintenance Windows y **AWS Config** |
+| Las tres capas | IAM previene, Config detecta, Automation remedia |
+| Parchear una flota | `AWS-RunPatchBaseline` → nueva AMI → launch template → **instance refresh** del ASG |
+| Parameter Store | Configuración y secretos, jerárquico, cifrado con KMS, permisos por prefijo |
+| `GetParametersByPath` | Recupera toda una rama de la jerarquía |
+| Parameter policies | TTL para forzar rotación. **Solo en tier advanced (de pago)** |
+| Rotación automática de credenciales | **Secrets Manager**, no Parameter Store |

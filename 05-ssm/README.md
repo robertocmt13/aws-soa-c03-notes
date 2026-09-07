@@ -2,7 +2,7 @@
 
 Notas de la Sección 5 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en progreso. Cubierto hasta ahora: lecciones 31 a 37.
+> Sección en progreso. Cubierto hasta ahora: lecciones 31 a 41.
 
 ---
 
@@ -387,6 +387,176 @@ El caso de uso típico es forzar la rotación de credenciales.
 > Si el enunciado menciona **rotación automática de credenciales de base de datos**, la
 > respuesta es **Secrets Manager**.
 
+### Práctica: crear y leer parámetros
+
+**Por consola.** El nombre del parámetro es donde se define la jerarquía directamente
+(`/my-app/dev/db-url`). Antes de crearlo se elige tier (Estándar / Avanzada) y tipo:
+
+| Tipo | Uso |
+|---|---|
+| `String` | Cualquier valor de cadena |
+| `StringList` | Cadenas separadas por comas |
+| `SecureString` | Valor cifrado con una clave KMS, propia o de otra cuenta |
+
+Al elegir `SecureString` se selecciona el **ID de la clave KMS**. La clave por defecto es
+`alias/aws/ssm` (gestionada por AWS, sin coste). La propia consola avisa de que las claves
+gestionadas por AWS no se pueden compartir con otras cuentas: para eso hace falta una customer
+managed key.
+
+Hay además un campo **Tipo de datos**, que valida el contenido:
+
+- `text` — sin validación
+- `aws:ec2:image` — SSM **verifica que el valor sea un AMI ID que existe** en esa región antes
+  de guardarlo. Útil para tener un parámetro tipo `/mi-empresa/golden-ami` que consumen las
+  plantillas, y evita el fallo de escribir un ID mal o de otra región.
+
+Cada parámetro tiene su propio **ARN**, su **versión** y un **historial** de cambios. El valor
+de un SecureString aparece oculto en el panel y hay que pulsar "Mostrar el valor descifrado".
+
+**Por CLI.** Lo importante de este bloque:
+
+```bash
+# Varios parámetros por nombre — el SecureString sale CIFRADO
+aws ssm get-parameters --names /my-app/dev/db-url /my-app/dev/db-password
+
+# Con --with-decryption sale en claro
+aws ssm get-parameters --names /my-app/dev/db-url /my-app/dev/db-password --with-decryption
+
+# Toda una rama de la jerarquía
+aws ssm get-parameters-by-path --path /my-app --recursive
+```
+
+Dos detalles que se aprenden solo haciéndolo:
+
+- **Sin `--with-decryption`**, el valor del SecureString se devuelve como un blob cifrado en
+  base64. Para descifrarlo, la identidad IAM necesita permiso **sobre la clave KMS**, no solo
+  sobre el parámetro. Son dos permisos distintos.
+- **Sin `--recursive`**, `get-parameters-by-path` solo devuelve el nivel inmediato de la ruta.
+  Con `--path /my-app` a secas no sale nada, porque los parámetros están un nivel más abajo.
+
+> Sobre el ARN: es el identificador único y global de un recurso, con la forma
+> `arn:aws:<servicio>:<región>:<cuenta>:<recurso>`. Donde más se usa es en políticas IAM, para
+> dar permisos por prefijo:
+> `"Resource": "arn:aws:ssm:eu-north-1:<cuenta>:parameter/my-app/dev/*"`
+
+---
+
+## SSM Fleet Manager
+
+Interfaz para **gestionar de forma centralizada y remota** los nodos, estén en AWS o
+on-premises: instancias EC2, servidores y VMs on-premise, dispositivos edge e IoT. Soporta
+Windows y Linux.
+
+Requisitos, los de siempre: **agente SSM instalado** y permisos, sea con
+`AmazonSSMManagedInstanceCore` en el rol de la instancia o mediante **DHMC**.
+
+Casos de uso:
+
+- Seguir el estado, salud y rendimiento de los nodos
+- Tareas de troubleshooting y administración: navegar el sistema de ficheros, ver logs,
+  consultar el registro de Windows, listar procesos
+- Abrir **RDP** en Windows o una shell con **Session Manager**
+
+### Fleet Manager vs Automation vs CloudWatch
+
+Tres herramientas que se confunden fácil pero no se solapan:
+
+| | Para qué |
+|---|---|
+| **Fleet Manager** | Mirar y **actuar a mano** sobre un nodo concreto. Es el "SSH de investigación" |
+| **Automation** | Ejecutar un runbook definido de antemano, **sin intervención** |
+| **CloudWatch** | Recoger **datos** (métricas, logs) y alertar. Unidireccional, no da acceso |
+
+El flujo real las encadena: la alarma de CloudWatch avisa de que el disco está al 90% y muestra
+desde cuándo → se entra con Fleet Manager a ver qué carpeta ha crecido y limpiarla → si el
+problema se repite, se escribe un runbook de Automation para que se resuelva solo.
+
+Fleet Manager mira **dentro de los servidores**; CloudWatch observa los **servicios desde
+fuera** (y no se limita a EC2: cubre RDS, S3, Lambda…).
+
+---
+
+## Default Host Management Configuration (DHMC)
+
+Configura automáticamente las instancias EC2 como managed instances **sin usar un EC2 Instance
+Profile**.
+
+### Cómo funciona
+
+1. La instancia se identifica ante SSM mediante el **Instance Identity Role**, un tipo de rol
+   IAM **sin permisos** más allá de identificar la instancia ante los servicios de AWS.
+2. SSM verifica esa identidad y le pasa el rol real,
+   `AWSSystemsManagerDefaultEC2InstanceManagementRole`, que es el que lleva los permisos
+   (política `AmazonSSMManagedEC2InstanceDefaultPolicy`).
+
+La instancia demuestra quién es y SSM le entrega los permisos, en lugar de llevarlos encima
+desde el principio.
+
+### Requisitos y alcance
+
+- **IMDSv2 obligatorio.** No soporta IMDSv1. Si una instancia no aparece con DHMC activado,
+  esta es la primera sospecha.
+- **Agente SSM 3.2.582.0 o superior.**
+- **Se habilita por región**, no por cuenta.
+- Activa automáticamente **Session Manager, Patch Manager e Inventory**, y **mantiene el agente
+  actualizado**.
+
+### Ventajas y matices
+
+La ventaja de seguridad es real: con el método clásico, quien consiga acceso a la instancia
+puede robar las credenciales del instance profile desde el metadata. Con DHMC no hay
+credenciales permanentes ahí.
+
+Pero conviene saber:
+
+- **Es todo o nada en la región**: gestiona *todas* las instancias EC2, incluidas las que
+  quizá no quieres en SSM.
+- **El rol es genérico**: cubre la gestión de SSM. Si la aplicación necesita acceder a S3,
+  DynamoDB u otros servicios, sigue haciendo falta un instance profile propio para eso.
+- **Si una instancia ya tiene instance profile, ese gana.** DHMC solo actúa sobre las que no
+  tienen ninguno. Desactivar DHMC tampoco afecta a esas instancias.
+
+### Adopción en entornos existentes
+
+No hace falta recrear la flota. **IMDSv2 se activa en caliente**, sin parar la instancia:
+
+```bash
+aws ec2 modify-instance-metadata-options \
+  --instance-id i-xxxxx \
+  --http-tokens required \
+  --http-endpoint enabled
+```
+
+El riesgo es que alguna aplicación siga usando IMDSv1. Antes de forzarlo conviene revisar la
+métrica de CloudWatch **`MetadataNoToken`**, que cuenta las llamadas que aún usan v1: si está a
+cero, se puede forzar sin miedo.
+
+La adopción real es gradual: se activa DHMC, las instancias nuevas nacen gestionadas, y las
+antiguas siguen con su instance profile hasta que toque renovarlas por otro motivo. Si además
+se va a crear una AMI nueva de todas formas, ahí sí compensa dejarla ya con IMDSv2 y el agente
+al día.
+
+> **IMDSv2 no se hereda de la AMI**: es un atributo de la instancia. Lo que sí se puede es
+> fijarlo en el **launch template**, para que todo lo que se lance desde ahí venga con v2
+> obligatorio.
+
+### Práctica realizada
+
+1. Activar DHMC en **eu-north-1** desde Fleet Manager → *Configurar la administración de hosts
+   predeterminada*. La propia pantalla ofrece **crear el rol** en el momento.
+2. Lanzar una instancia (`DemoInstance`, Amazon Linux 2023) **sin ningún rol IAM**. La consola
+   ya la crea con *Versión de metadatos: Solo V2 (token obligatorio)*, avisando de que las
+   aplicaciones que usen V1 dejarán de funcionar.
+3. Comprobar en los detalles de la instancia: **Rol de IAM vacío**, `IMDSv2: Required`.
+4. En Fleet Manager, la instancia aparece igualmente como **Online**, con la versión del agente
+   (3.3.4624.0 en esta prueba).
+
+Detalle curioso: en los detalles de EC2 el campo **"Administradas" pone `falso`** — porque no
+tiene instance profile — y aun así SSM la gestiona. Son dos vistas distintas del mismo hecho.
+
+> En el vídeo la instancia no aparecía y hubo que revisar la versión del agente. Con la AMI de
+> Amazon Linux 2023 actual el agente ya viene por encima del mínimo y funciona directamente.
+
 ---
 
 ## Limpieza
@@ -399,6 +569,9 @@ El caso de uso típico es forzar la rotación de credenciales.
 | Resource groups | No | Regionales |
 | Security group | No | — |
 | Rol IAM `AmazonEC2RoleForSSM` | No | **Conservar**: se reutiliza en el resto de la sección |
+| Parámetros de Parameter Store | No | Tier estándar, sin coste. Clave `alias/aws/ssm` tampoco cuesta |
+| DHMC | No | Se desactiva desde Fleet Manager. Desactivarlo no afecta a instancias con instance profile |
+| Rol `AWSSystemsManagerDefaultEC2InstanceManagementRole` | No | Lo crea DHMC al activarlo |
 | Consola unificada en `us-east-1` | No | Pendiente de revertir |
 
 ---
@@ -425,3 +598,11 @@ El caso de uso típico es forzar la rotación de credenciales.
 | `GetParametersByPath` | Recupera toda una rama de la jerarquía |
 | Parameter policies | TTL para forzar rotación. **Solo en tier advanced (de pago)** |
 | Rotación automática de credenciales | **Secrets Manager**, no Parameter Store |
+| `--with-decryption` | Necesario para leer un SecureString en claro. Requiere permiso **sobre la clave KMS** |
+| `--recursive` | Sin él, `get-parameters-by-path` solo devuelve el nivel inmediato |
+| Tipo de dato `aws:ec2:image` | Valida que el valor sea un AMI ID existente en esa región |
+| Fleet Manager | Investigar y actuar a mano sobre un nodo. No solo EC2: on-premise, VMs, edge, IoT |
+| DHMC | Instancias gestionadas **sin instance profile**. Por región. Requiere **IMDSv2** y agente ≥ 3.2.582.0 |
+| Instance Identity Role | Rol **sin permisos**, solo identifica la instancia ante AWS |
+| Instancia con instance profile | DHMC no la toca; el instance profile tiene prioridad |
+| `MetadataNoToken` | Métrica de CloudWatch para saber si algo aún usa IMDSv1 antes de forzar v2 |

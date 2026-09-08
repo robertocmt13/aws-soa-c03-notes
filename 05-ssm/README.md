@@ -2,7 +2,7 @@
 
 Notas de la Sección 5 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en progreso. Cubierto hasta ahora: lecciones 31 a 41.
+> Sección en progreso. Cubierto hasta ahora: lecciones 31 a 42.
 
 ---
 
@@ -559,6 +559,209 @@ tiene instance profile — y aun así SSM la gestiona. Son dos vistas distintas 
 
 ---
 
+## SSM Inventory
+
+Recolecta **metadatos** de los nodos gestionados, EC2 y on-premises: software instalado, drivers
+del SO, configuraciones, actualizaciones aplicadas, servicios en ejecución.
+
+- Se puede **fijar el intervalo** de recolección (minutos, horas, días). El mínimo real es de 30
+  minutos: no es una herramienta de tiempo real.
+- Los datos se ven en la **consola**, o se almacenan en **S3** para consultarlos con **Athena** y
+  representarlos con **QuickSight**.
+- Permite **consultar datos de varias cuentas y regiones** de forma centralizada.
+- Se puede definir **Custom Inventory** para metadatos propios (el ejemplo del curso: la ubicación
+  en rack de cada nodo).
+- Es de solo lectura y **no tiene coste** por sí mismo.
+
+### Athena y QuickSight
+
+Ninguno de los dos es de SSM; aparecen aquí solo como consumidores del inventario:
+
+- **Athena** ejecuta consultas SQL directamente sobre ficheros en S3, sin cargar nada en una base
+  de datos. Se factura por **volumen de datos escaneados** en cada consulta.
+- **QuickSight** es la capa de dashboards encima de esos datos.
+
+Para el examen basta la cadena: **Inventory → Resource Data Sync → S3 → Athena → QuickSight**.
+
+### Inventory vs CloudWatch
+
+Se parecen en que ambos recogen información de las máquinas, pero el eje que los separa no es la
+cantidad de datos sino **estado frente a serie temporal**:
+
+| | CloudWatch | Inventory |
+|---|---|---|
+| Qué almacena | Valores numéricos en el tiempo | Hechos sobre la máquina |
+| Ejemplo | CPU al 40 % a las 15:03 | Kernel 6.1.x, `httpd 2.4.62` instalado |
+| Cadencia | Segundos o minutos | 30 minutos como mínimo |
+| Pregunta que responde | ¿Cómo se comporta? | ¿Qué hay dentro? |
+
+### Dónde se consultan los datos
+
+| Vista | Requisitos |
+|---|---|
+| **Inventory → Dashboard** | Ninguno. Tarjetas predefinidas sobre los nodos de la región |
+| **Fleet Manager → nodo → Inventory** | Ninguno. Los datos de una máquina concreta |
+| **Inventory → Detailed View** | **Resource Data Sync + AWS Glue + Athena**. Tiene coste |
+
+Solo la tercera necesita infraestructura adicional. Es fácil confundirse y pensar que sin sync no
+se ve el inventario.
+
+---
+
+## SSM State Manager
+
+Automatiza el mantenimiento de los nodos gestionados **en un estado definido**.
+
+La unidad de trabajo es la **association**, que se compone de tres cosas:
+
+1. El **estado** que se quiere mantener, expresado como un **documento SSM**
+2. Los **objetivos** (por tags, manualmente o por resource group)
+3. Un **schedule**: cada cuánto se aplica
+
+Casos de uso típicos: aprovisionar software al arrancar (*bootstrap*), aplicar actualizaciones del
+SO de forma periódica, mantener el agente de CloudWatch configurado, garantizar que un antivirus
+está instalado o que un puerto está cerrado.
+
+### El matiz importante: State Manager no decide nada
+
+Es tentador imaginar un bucle del tipo *"State Manager consulta Inventory, ve que falta un parche y
+lo instala"*. **Ese bucle no existe.**
+
+State Manager es un **planificador**: ejecuta el documento sobre los objetivos con la periodicidad
+indicada, siempre, haya cambiado algo o no. Quien decide qué hace falta es **el documento**, porque
+está escrito para ser **idempotente**: `AWS-RunPatchBaseline` entra en la máquina, compara contra
+la patch baseline y aplica solo lo que falta. Si ya está al día, no hace nada.
+
+Inventory es el lado de **lectura** (qué hay) y Compliance el de **resultado** (si la association
+quedó conforme). Ninguno de los dos alimenta a State Manager.
+
+> La forma correcta de plantear *"quiero este parche en todas las instancias con
+> `Environment: Dev`"* es: una association con `AWS-RunPatchBaseline`, objetivo por ese tag, con
+> schedule. El destino es ese; lo que no existe es la consulta previa al inventario.
+
+El bucle real de *"comprobar el estado y corregir si no cumple"* sí está en AWS, pero es el trío ya
+visto en Automation: **IAM previene → Config detecta → Automation remedia**.
+
+Detalle que cierra el círculo: **la propia recolección de Inventory es una association de State
+Manager**, con el documento `AWS-GatherSoftwareInventory`. Cuando en la consola se configura el
+inventario, lo que se crea por debajo es una association. Es el mejor ejemplo de que State Manager
+es el motor de programación de SSM y no una herramienta con criterio propio.
+
+### Run Command vs State Manager
+
+Las dos ejecutan documentos sobre instancias. La diferencia es el eje temporal:
+
+| | Run Command | State Manager |
+|---|---|---|
+| Cuándo se ejecuta | **Una vez**, cuando se lanza | **De forma recurrente**, según schedule |
+| Para qué sirve | Una acción puntual sobre la flota | Mantener una configuración en el tiempo |
+| Qué deja detrás | Un historial de ejecución | Una association viva |
+| Instancias nuevas | No las alcanza | **Sí**, si encajan con el targeting por tag |
+
+Esa última fila es la que más se aprovecha en la práctica: una association apuntando a un tag
+alcanza automáticamente a cualquier instancia futura que nazca con ese tag.
+
+---
+
+## Resource Data Sync
+
+Envía el inventario de una región a un **bucket S3**, para poder consultarlo de forma centralizada.
+Varias regiones y varias cuentas pueden escribir al mismo bucket, y ahí es donde entra la consulta
+con Athena.
+
+Los objetos quedan organizados por tipo de dato, cuenta y región:
+
+```
+AWS:InstanceInformation/accountid=<cuenta>/region=eu-north-1/...
+```
+
+**El sync no crea el bucket**: tiene que existir antes, y con una bucket policy que permita a SSM
+escribir en él.
+
+### Práctica realizada
+
+1. Lanzar 3 instancias `t3.micro` con el instance profile `AmazonEC2RoleForSSM` y los tags
+   `Environment` y `Team` (`ContabilidadDev`, `ContabilidadPro`, `DesarrolloDev`).
+2. Crear el bucket S3 en `eu-north-1`.
+3. Añadirle una bucket policy que autorice al servicio SSM a escribir.
+4. Crear el Resource Data Sync desde **Inventory → Resource data syncs → Create**.
+5. Verificar `Last status: Successful` y comprobar los objetos en el bucket.
+
+La bucket policy se resolvió leyendo la documentación de AWS, sin seguir el vídeo. Es el patrón
+estándar de *"un servicio de AWS escribe en mi bucket"* y conviene entender por qué tiene la forma
+que tiene:
+
+```json
+{
+  "Sid": "SSMBucketPermissionsCheck",
+  "Effect": "Allow",
+  "Principal": { "Service": "ssm.amazonaws.com" },
+  "Action": "s3:GetBucketAcl",
+  "Resource": "arn:aws:s3:::<bucket>"
+},
+{
+  "Sid": "SSMBucketDelivery",
+  "Effect": "Allow",
+  "Principal": { "Service": "ssm.amazonaws.com" },
+  "Action": "s3:PutObject",
+  "Resource": ["arn:aws:s3:::<bucket>/*/accountid=<cuenta>/*"],
+  "Condition": {
+    "StringEquals": {
+      "s3:x-amz-acl": "bucket-owner-full-control",
+      "aws:SourceAccount": "<cuenta>"
+    },
+    "ArnLike": {
+      "aws:SourceArn": "arn:aws:ssm:*:<cuenta>:resource-data-sync/*"
+    }
+  }
+}
+```
+
+- Son **dos sentencias con recursos distintos a propósito**: `s3:GetBucketAcl` es SSM comprobando
+  que puede escribir *antes* de intentarlo, por eso apunta al bucket a secas, sin `/*`.
+  `s3:PutObject` es la escritura real y apunta a la ruta.
+- Las condiciones `aws:SourceAccount` y `aws:SourceArn` **no son decoración**: sin ellas la política
+  autoriza al servicio SSM de **cualquier cuenta** a escribir en el bucket. Es la protección contra
+  el problema del *confused deputy*.
+- El `Sid` debe ser **alfanumérico**: un espacio delante del nombre es un error silencioso fácil de
+  colar.
+
+### Problemas encontrados
+
+**1. `PermanentRedirect`: el nombre del bucket ya existía**
+
+Al crear el sync con el bucket llamado `demo-ssm-inventory`:
+
+```
+[ResourceDataSyncInvalidConfigurationException] S3 write failed ... due to
+[The bucket is in this region: eu-central-1. Please use this region to retry
+the request (Status Code: 301; Error Code: PermanentRedirect)]
+```
+
+La causa no era la región configurada en el formulario, sino que **ese nombre de bucket ya existía
+y era de otra cuenta**, en `eu-central-1`. El **espacio de nombres de S3 es global**: no hay dos
+buckets con el mismo nombre en todo AWS, independientemente de la cuenta y la región. Cualquier
+nombre genérico está cogido.
+
+> En el examen esto aparece disfrazado: *"el equipo no puede crear un bucket con el nombre X, ¿por
+> qué?"* → el nombre ya está en uso a nivel global.
+
+**2. `Cannot get Role for the user` en Detailed View**
+
+Con el sync ya funcionando (`Successful`), la pestaña **Detailed View** devuelve ese error.
+
+No es un problema del sync ni de permisos del usuario. La Detailed View **no lee de S3
+directamente**: necesita un **crawler de AWS Glue** que catalogue los ficheros y **Athena** para
+consultarlos, y para eso la documentación exige configurar la entidad IAM y un rol de servicio
+específico (`Amazon-GlueServiceRoleForSSM`) que no existe hasta que se monta esa integración. La
+consola falla al buscarlo, y falla igual siendo administrador: no falta un permiso, falta un rol.
+
+**Decisión: no se ha montado.** Implica dejar un crawler de Glue ejecutándose y consultas de Athena,
+**ambos facturables** (la propia consola lo avisa en un banner), y no entra en el temario del
+SOA-C03. Para verificar la práctica basta con comprobar los objetos directamente en el bucket.
+
+---
+
 ## Limpieza
 
 | Recurso | ¿Factura? | Nota |
@@ -570,9 +773,27 @@ tiene instance profile — y aun así SSM la gestiona. Son dos vistas distintas 
 | Security group | No | — |
 | Rol IAM `AmazonEC2RoleForSSM` | No | **Conservar**: se reutiliza en el resto de la sección |
 | Parámetros de Parameter Store | No | Tier estándar, sin coste. Clave `alias/aws/ssm` tampoco cuesta |
+| Resource Data Sync | No | Borrarlo **primero**, para que deje de escribir. Borrarlo **no vacía el bucket** |
+| Bucket S3 del inventario | **Sí** | Vaciar y después borrar. La consola no borra un bucket con objetos |
+| Associations de State Manager | No | Borrarlas: si apuntan a un tag, alcanzan a cualquier instancia futura con ese tag |
 | DHMC | No | Se desactiva desde Fleet Manager. Desactivarlo no afecta a instancias con instance profile |
 | Rol `AWSSystemsManagerDefaultEC2InstanceManagementRole` | No | Lo crea DHMC al activarlo |
 | Consola unificada en `us-east-1` | No | Pendiente de revertir |
+| Bucket `do-not-delete-ssm-diagnosis-<cuenta>-us-east-1-…` | **Sí** | Lo crea la función *Diagnose and remediate* de la consola unificada. Borrarlo **después** de desactivarla, o se vuelve a crear |
+
+### Orden de borrado del inventario
+
+El Resource Data Sync **no se borra desde la pestaña de Inventory**, que solo lo lista. Está en
+Fleet Manager, en la pestaña de gestión de la cuenta. Como AWS ha movido esa pantalla varias veces
+entre Inventory, Fleet Manager y Settings, la CLI va a tiro fijo:
+
+```bash
+aws ssm list-resource-data-sync --region eu-north-1
+aws ssm delete-resource-data-sync --sync-name DemoSync --region eu-north-1
+```
+
+Después se vacía y se borra el bucket. Borrar el sync corta la escritura, pero **no elimina los
+objetos ya sincronizados**.
 
 ---
 
@@ -602,6 +823,15 @@ tiene instance profile — y aun así SSM la gestiona. Son dos vistas distintas 
 | `--recursive` | Sin él, `get-parameters-by-path` solo devuelve el nivel inmediato |
 | Tipo de dato `aws:ec2:image` | Valida que el valor sea un AMI ID existente en esa región |
 | Fleet Manager | Investigar y actuar a mano sobre un nodo. No solo EC2: on-premise, VMs, edge, IoT |
+| Inventory | Metadatos de los nodos: software, drivers, configuración, servicios. Solo lectura y sin coste |
+| Inventory vs CloudWatch | Estado (qué hay dentro) vs serie temporal (cómo se comporta) |
+| Consulta centralizada del inventario | **Resource Data Sync → S3 → Athena → QuickSight**, multi-cuenta y multi-región |
+| State Manager | Mantiene los nodos en un estado definido mediante **associations** (documento + objetivos + schedule) |
+| State Manager no consulta Inventory | La idempotencia está **en el documento**, no en el planificador |
+| Recolección de Inventory | Es una **association de State Manager** con `AWS-GatherSoftwareInventory` |
+| Run Command vs State Manager | Una vez vs recurrente. Solo State Manager alcanza a instancias futuras con el tag |
+| Nombres de bucket S3 | **Namespace global**. Un nombre repetido da `301 PermanentRedirect` |
+| Bucket policy para un servicio | `GetBucketAcl` sobre el bucket + `PutObject` sobre la ruta, con `aws:SourceAccount` y `aws:SourceArn` contra el *confused deputy* |
 | DHMC | Instancias gestionadas **sin instance profile**. Por región. Requiere **IMDSv2** y agente ≥ 3.2.582.0 |
 | Instance Identity Role | Rol **sin permisos**, solo identifica la instancia ante AWS |
 | Instancia con instance profile | DHMC no la toca; el instance profile tiene prioridad |

@@ -2,7 +2,7 @@
 
 Notas de la Sección 5 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en progreso. Cubierto hasta ahora: lecciones 31 a 42.
+> Sección completada. Lecciones 31 a 49 y cuestionario final (7/7).
 
 ---
 
@@ -762,6 +762,291 @@ SOA-C03. Para verificar la práctica basta con comprobar los objetos directament
 
 ---
 
+## SSM Patch Manager
+
+Automatiza el parcheado de los nodos gestionados: actualizaciones del SO, de aplicaciones y de
+seguridad. Sirve para EC2 y on-premises, y soporta Linux, macOS y Windows.
+
+Puede parchear **bajo demanda** o **de forma programada** mediante Maintenance Windows, y genera un
+**informe de compliance** con los parches que faltan, que se puede enviar a S3.
+
+### Las dos piezas: Baseline y Group
+
+Es lo que más se confunde de esta lección, porque son **dos selecciones distintas en momentos
+distintos**:
+
+| | Qué decide | Cuándo actúa |
+|---|---|---|
+| **Targeting** | A qué instancias se lanza la operación *ahora* | Al ejecutar (Run Command o la tarea de la Maintenance Window) |
+| **Patch Group** | Qué baseline le corresponde a cada instancia | Ya dentro de la máquina, durante la ejecución |
+
+Son independientes. Se puede lanzar el parcheo a 50 instancias filtrando por `Environment=Dev`, y
+cada una de esas 50 mirará **su propio tag `Patch Group`** para saber qué baseline aplicar.
+
+En corto: **la Patch Baseline es el "qué parches"; el Patch Group es el "a quién le toca cada
+baseline"**.
+
+**Patch Baseline**
+
+- Define qué parches se instalan y cuáles no
+- **Por defecto instala solo parches críticos y de seguridad**
+- Los parches se pueden **auto-aprobar pasados X días** desde su publicación
+- Predefinidas por AWS (una por sistema operativo, **no modificables**) o personalizadas
+
+**Patch Group**
+
+- Asocia un conjunto de instancias a una baseline concreta
+- Las instancias se identifican con la **clave de tag literal `Patch Group`** (con ese espacio y
+  esas mayúsculas)
+- Una instancia solo puede estar en **un** Patch Group
+- Un Patch Group solo se registra con **una** baseline
+- Pero **una baseline sí puede servir a varios Patch Groups** (la restricción no es simétrica)
+- Si una instancia no tiene ese tag, o su valor no está registrado, cae en la **baseline por
+  defecto de su sistema operativo**
+
+Se puede marcar una baseline propia como **default** para un SO: entonces las instancias sin Patch
+Group registrado pasan a usar la tuya en lugar de la de AWS.
+
+### Baseline no es lo mismo que Document
+
+Son dos recursos distintos que trabajan juntos, y conviene no mezclarlos:
+
+- El **documento** es `AWS-RunPatchBaseline`: el código que se ejecuta dentro de la instancia
+- La **baseline** son los datos que ese documento consulta: aprobados, rechazados, días de margen
+
+El documento es siempre el mismo; lo que cambia entre instancias es la baseline que consulta.
+
+> En una diapositiva del curso aparece `AWS-RunBatchBaseline`. Es una **errata**: el nombre correcto
+> es `AWS-RunPatchBaseline`, y el examen lo usa tal cual como opción de respuesta.
+
+Existen variantes del documento: `AWS-RunPatchBaselineAssociation` (para associations) y
+`AWS-RunPatchBaselineWithHooks` (permite ejecutar acciones entre fases).
+
+### Scan frente a Install
+
+El parámetro `Operation` del documento tiene dos valores, y la diferencia importa:
+
+| | Qué hace | Riesgo |
+|---|---|---|
+| **Scan** | Compara e informa. Genera el compliance report | Ninguno, no toca la máquina |
+| **Install** | Aplica los parches que faltan | **Puede reiniciar la instancia** |
+
+En el examen: *"quiero saber qué parches faltan sin arriesgar un reinicio"* → **Scan**.
+
+El informe de compliance a S3 usa el mismo mecanismo que el inventario: un **Resource Data Sync**.
+Por eso Inventory, Compliance y Patch Manager acaban en el mismo sitio.
+
+### Rate control
+
+Al usar Maintenance Windows se especifica un rate control, que son **dos parámetros distintos**:
+
+- **Concurrency**: cuántos objetivos se procesan a la vez (número o porcentaje)
+- **Error threshold**: cuántos fallos se toleran antes de abortar la operación entera
+
+El segundo es el que evita que un parche defectuoso se lleve por delante toda la flota.
+
+---
+
+## SSM Maintenance Windows
+
+Define **cuándo** se ejecutan acciones sobre las instancias: parcheado, actualización de drivers,
+instalación de software.
+
+Una Maintenance Window contiene **schedule, duración, instancias registradas y tareas registradas**.
+
+Opciones que conviene entender, porque no son evidentes:
+
+| Opción | Qué hace |
+|---|---|
+| **Allow unregistered targets** | Si está marcada, los objetivos se especifican al registrar la tarea. Si no, solo se pueden usar los registrados en la pestaña *Targets* |
+| **Stop initiating tasks** (cutoff) | Cuántas horas antes del cierre se deja de lanzar tareas nuevas. Con duración 2 h y cutoff 1 h, a partir de la primera hora no arranca nada nuevo aunque la ventana siga abierta |
+| **IAM service role** | Rol que permite a la ventana actuar en tu nombre. **Sin él la tarea no se ejecuta**. Es distinto del instance profile de la instancia |
+| **Task priority** | Número más bajo, mayor prioridad. Las tareas con la misma prioridad se ejecutan en paralelo |
+
+El schedule se puede definir con cron builder, rate builder o expresión CRON/Rate directa, con
+timezone IANA y un *schedule offset* opcional.
+
+### Patch policy frente a Maintenance Window
+
+El curso enseña **dos caminos distintos** para parchear, y no son intercambiables:
+
+| | Patch policy | Maintenance Window |
+|---|---|---|
+| Dónde vive | **Quick Setup** | Systems Manager |
+| Alcance | Multi-cuenta y multi-región | Una región |
+| Qué crea por debajo | Associations de State Manager | Tareas registradas en la ventana |
+| Cuándo elegirlo | Flota grande con política uniforme | Control fino de la ventana temporal |
+
+Una patch policy se borra **desde Quick Setup**, no desde Patch Manager.
+
+### Práctica realizada
+
+1. Recorrer el asistente de **Create patch policy** sin llegar a crearla (el curso tampoco la crea).
+2. Revisar las pestañas de Patch Manager: **Patch baselines** (17 predefinidas, una por SO) y
+   **Patches** (catálogo por SO y producto, con clasificación, severidad, CVE y advisory IDs).
+3. Crear una **Maintenance Window** (`Daily` a las 03:00, duración 2 h) y revisar sus pestañas.
+4. **Registrar una tarea de Run Command** con el documento `AWS-RunPatchBaseline`, seleccionando la
+   instancia y configurando el rate control.
+5. Borrar la ventana al terminar.
+
+Detalles observados en el asistente de patch policy:
+
+- Los horarios de **scan e install son independientes**: por defecto escaneo diario a la 1:00 UTC e
+  instalación semanal los domingos a las 2:00 UTC. No van encadenados, porque escanear es inocuo y
+  se puede hacer a diario, mientras que instalar puede reiniciar.
+- **Reboot if needed** controla el `RebootOption`. Si un parche necesita reinicio y no se permite,
+  queda instalado a medias hasta el siguiente arranque.
+- **Instance profile options**: si no se marca la casilla, **Quick Setup no toca las instancias que
+  ya tienen instance profile**. Con un rol propio ya asignado, el parcheo falla por permisos
+  aunque el nodo aparezca como gestionado. Es un fallo difícil de diagnosticar.
+- El compliance de un nodo que nunca ha sido escaneado aparece como `Never reported`.
+
+---
+
+## SSM Session Manager
+
+Abre una shell segura en instancias EC2 y servidores on-premises **sin SSH, sin bastion host y sin
+claves SSH**. Accesible desde consola, CLI o SDK. Soporta Linux, macOS y Windows.
+
+### Cómo funciona sin abrir puertos
+
+**El agente abre la conexión hacia fuera, no el usuario hacia dentro.** El SSM Agent mantiene una
+conexión saliente contra el endpoint de Systems Manager; cuando se solicita una sesión, la orden
+llega por ese canal ya abierto y el agente levanta la shell haciendo de túnel.
+
+Por eso el security group de la instancia **no necesita ninguna regla de entrada**. Es la inversión
+del modelo de SSH, donde el usuario inicia la conexión contra el puerto 22 y por eso hay que
+abrirlo y protegerlo.
+
+Consecuencia que cae en el examen: **una instancia en subred privada, sin IP pública y sin bastión,
+es accesible por Session Manager**. Solo necesita salida hacia SSM (NAT gateway o VPC endpoints).
+
+La política necesaria es `AmazonSSMManagedInstanceCore`, la misma que ya lleva el rol usado durante
+toda la sección. No hace falta añadir nada.
+
+### Auditoría: dos capas distintas
+
+| | Qué registra |
+|---|---|
+| **CloudTrail** | Que alguien llamó a `StartSession` sobre la instancia X, cuándo y con qué credenciales |
+| **Session logs** (S3 / CloudWatch Logs) | **Lo que se tecleó dentro** de la sesión |
+
+CloudTrail dice que alguien entró; los session logs dicen qué hizo. Una auditoría necesita ambos.
+
+El campo **Reason** que se rellena al iniciar la sesión acaba en el evento de CloudTrail. En un
+entorno con cambios controlados, ahí va la referencia del ticket.
+
+### Control de acceso
+
+IAM decide **si puedes abrir la sesión**, no lo que tecleas dentro. Se puede restringir por tag:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "ssm:StartSession",
+  "Resource": "arn:aws:ec2:<region>:<cuenta>:instance/*",
+  "Condition": {
+    "StringLike": { "ssm:resourceTag/Environment": ["Dev"] }
+  }
+}
+```
+
+Para limitar **qué comandos** se pueden ejecutar no vale IAM: se crea un **documento de sesión
+propio** que solo permita ciertas acciones, y la política autoriza a iniciar sesión con ese
+documento en lugar de con el genérico.
+
+Session Manager **no sustituye al control de permisos del sistema operativo**: por defecto conecta
+con el usuario `ssm-user`, y limitarle sudo sigue siendo trabajo de sudoers.
+
+### Preferencias de sesión
+
+| Opción | Detalle |
+|---|---|
+| **Idle session timeout** | De 1 a 60 minutos. Por defecto 20 |
+| **Maximum session duration** | De 1 a 1440 minutos. Opcional |
+| **KMS encryption** | Cifrado adicional sobre el TLS 1.2 que ya se usa |
+| **Run As** | Conectar con un usuario del SO en lugar de `ssm-user`, etiquetando el usuario o rol IAM con la clave `SSMSessionRunAs` |
+| **Logging** | S3 y/o CloudWatch Logs |
+
+### Práctica realizada
+
+1. **Cambiar el security group de la instancia por uno sin el puerto 22 abierto** (solo 80).
+2. Iniciar sesión desde Session Manager → conexión correcta pese a no haber SSH.
+3. Instalar `httpd` dentro de la sesión y comprobar la página por la IP pública: la shell es
+   completa.
+4. Revisar **Session history**, donde aparece el ARN completo del usuario IAM que abrió la sesión.
+5. Revisar **Preferences**.
+6. Terminar la instancia.
+
+Quitar el SSH del security group **antes** de conectar es lo que hace que la práctica demuestre
+algo: si no, no se sabe por dónde entró la conexión.
+
+Detalle observado: el prompt de la sesión es `sh-5.2$`, no el habitual `[ec2-user@ip-...]$`, porque
+se conecta como `ssm-user`. Ese usuario **tiene sudo sin contraseña por defecto**, que es lo primero
+que se toca en un entorno real.
+
+---
+
+## SSM Distributor
+
+Empaqueta y despliega software propio a los nodos gestionados.
+
+- Se crea un **Distributor Package**, que es un documento SSM
+- El contenido se almacena en **S3**: un zip por plataforma (script de instalación, de
+  desinstalación y el ejecutable) más un **manifiesto JSON**
+- Se pueden usar paquetes de AWS, de terceros, o propios
+
+Instalación, con la misma distinción de siempre:
+
+| Cuándo | Cómo |
+|---|---|
+| **Una vez** | Run Command |
+| **De forma recurrente** | State Manager con el documento `AWS-ConfigureAWSPackage` |
+
+> **Distributor instala software; Patch Manager actualiza lo que ya está.** Si el enunciado habla de
+> desplegar un agente propio en toda la flota → Distributor. Si habla de mantener el SO al día →
+> Patch Manager.
+
+---
+
+## SSM OpsCenter
+
+Centraliza la visualización, investigación y remediación de incidencias operativas **en un solo
+sitio**, sin saltar entre consolas de distintos servicios.
+
+La unidad de trabajo es el **OpsItem**: un problema que necesita investigación y remediación, con
+estado, prioridad, recursos relacionados y **runbooks recomendados** para resolverlo. Funciona con
+EC2 y con nodos on-premises.
+
+Los OpsItems llegan desde **CloudWatch y Application Insights, EventBridge, Config, Security Hub,
+DevOps Guru e Incident Manager**.
+
+La clave para el examen es que **OpsCenter agrega, no ejecuta**:
+
+| Función | Quién la hace |
+|---|---|
+| Agregar los problemas y sugerir runbooks | **OpsCenter** |
+| Notificar | EventBridge, Incident Manager |
+| Remediar | **Automation**, ejecutando el runbook |
+
+Si el enunciado dice *"el equipo pierde tiempo saltando entre consolas para investigar
+incidencias"* → OpsCenter. Si dice *"quiero que se corrija automáticamente"* → Automation.
+
+### Ejemplo del curso: volúmenes EBS huérfanos
+
+Un caso de reducción de costes que ilustra bien el reparto de papeles:
+
+1. **EventBridge** invoca periódicamente una **función Lambda**
+2. La Lambda lista los volúmenes EBS y busca los que llevan más de 45 días
+3. Crea un **OpsItem** en OpsCenter por cada uno
+4. **Automation** ejecuta el documento correspondiente (crear snapshot o borrar)
+
+La Lambda **detecta**, no borra. OpsCenter queda en medio como registro y punto de decisión, que es
+justo lo que permite revisar antes de que algo se elimine. Es el mismo patrón de Automation:
+**detectar → registrar → remediar**.
+
+---
+
 ## Limpieza
 
 | Recurso | ¿Factura? | Nota |
@@ -776,9 +1061,11 @@ SOA-C03. Para verificar la práctica basta con comprobar los objetos directament
 | Resource Data Sync | No | Borrarlo **primero**, para que deje de escribir. Borrarlo **no vacía el bucket** |
 | Bucket S3 del inventario | **Sí** | Vaciar y después borrar. La consola no borra un bucket con objetos |
 | Associations de State Manager | No | Borrarlas: si apuntan a un tag, alcanzan a cualquier instancia futura con ese tag |
+| Maintenance Window | No | Borrarla igualmente: las ejecuciones ya en curso terminan, las futuras no se lanzan |
+| Patch policy | No | Se borra **desde Quick Setup**, no desde Patch Manager |
 | DHMC | No | Se desactiva desde Fleet Manager. Desactivarlo no afecta a instancias con instance profile |
 | Rol `AWSSystemsManagerDefaultEC2InstanceManagementRole` | No | Lo crea DHMC al activarlo |
-| Consola unificada en `us-east-1` | No | Pendiente de revertir |
+| Consola unificada en `us-east-1` | No | Revertida. **No se borra desde Quick Setup**: se desactiva en Systems Manager → **Settings** → *Disable* |
 | Bucket `do-not-delete-ssm-diagnosis-<cuenta>-us-east-1-…` | **Sí** | Lo crea la función *Diagnose and remediate* de la consola unificada. Borrarlo **después** de desactivarla, o se vuelve a crear |
 
 ### Orden de borrado del inventario
@@ -794,6 +1081,28 @@ aws ssm delete-resource-data-sync --sync-name DemoSync --region eu-north-1
 
 Después se vacía y se borra el bucket. Borrar el sync corta la escritura, pero **no elimina los
 objetos ya sincronizados**.
+
+### Revertir la consola unificada
+
+Activar la consola unificada crea una configuración de tipo `Integrated Systems Manager console`
+que **aparece en Quick Setup pero no se puede borrar desde ahí**: el botón de acciones no ofrece la
+opción. Se desactiva en **Systems Manager → Settings → Account setup → Disable**.
+
+Ese botón solo aparece si la cuenta **no pertenece a AWS Organizations**, o si el administrador
+delegado no la ha añadido a Systems Manager.
+
+Desactivar **no borra todo**: elimina los recursos creados durante el onboarding, pero quedan
+artefactos que hay que limpiar a mano. Orden correcto:
+
+1. Settings → Disable
+2. Comprobar que la fila desaparece de Quick Setup
+3. Revisar State Manager: no debe quedar ninguna association
+   (`AWS-GatherSoftwareInventory`, `AWS-UpdateSSMAgent`)
+4. Verificar que DHMC quedó desactivado en esa región
+5. **Y entonces** vaciar y borrar el bucket `do-not-delete-ssm-diagnosis-…`
+
+El sufijo del nombre del bucket coincide con el **resource code** de la configuración en Quick
+Setup, lo que confirma cuál lo creó.
 
 ---
 
@@ -836,3 +1145,26 @@ objetos ya sincronizados**.
 | Instance Identity Role | Rol **sin permisos**, solo identifica la instancia ante AWS |
 | Instancia con instance profile | DHMC no la toca; el instance profile tiene prioridad |
 | `MetadataNoToken` | Métrica de CloudWatch para saber si algo aún usa IMDSv1 antes de forzar v2 |
+| Patch Manager | Automatiza el parcheado. **Por defecto solo parches críticos y de seguridad** |
+| Patch Baseline vs Patch Group | La baseline es el *qué parches*; el group es *a quién le toca cada baseline* |
+| Tag del Patch Group | Clave literal **`Patch Group`**, con espacio y mayúsculas |
+| Reglas del Patch Group | Una instancia en un solo group; un group con una sola baseline; **una baseline sí sirve a varios groups** |
+| Baselines predefinidas | Una por SO, **no modificables**. Se puede marcar una propia como default |
+| `AWS-RunPatchBaseline` | El documento que se ejecuta. La baseline son los **datos** que consulta |
+| `Operation: Scan` vs `Install` | Scan solo informa; Install aplica y **puede reiniciar** |
+| Informe de patch compliance | A S3 mediante **Resource Data Sync** |
+| Rate control | **Concurrency** (cuántos a la vez) + **error threshold** (cuántos fallos antes de abortar) |
+| Maintenance Window | Schedule + duración + instancias registradas + tareas registradas |
+| Cutoff de la ventana | Deja de lanzar tareas nuevas X horas antes del cierre |
+| IAM service role de la ventana | Sin él la tarea no se ejecuta. Distinto del instance profile |
+| Patch policy vs Maintenance Window | Quick Setup, multi-cuenta/región vs una región con control fino |
+| Session Manager | Shell **sin SSH, sin bastión y sin claves**. Sin reglas de entrada en el security group |
+| Instancia en subred privada | Accesible por Session Manager; solo necesita salida hacia SSM |
+| CloudTrail vs session logs | `StartSession` (quién entró) vs lo que se tecleó dentro |
+| Restringir acceso a sesiones | IAM por tag con `ssm:StartSession`. Para limitar comandos, **documento de sesión propio** |
+| Usuario de la sesión | `ssm-user` por defecto; **Run As** con el tag `SSMSessionRunAs` para usar otro |
+| Distributor | Empaqueta y despliega software propio. Contenido en S3 + manifiesto JSON |
+| Instalar un paquete | Una vez → Run Command. Recurrente → State Manager con `AWS-ConfigureAWSPackage` |
+| Distributor vs Patch Manager | Instalar software nuevo vs actualizar lo ya instalado |
+| OpsCenter | **Agrega** incidencias de varios servicios y sugiere runbooks. No notifica ni remedia |
+| OpsItem | La unidad de trabajo: problema con estado, prioridad, recursos y runbooks recomendados |

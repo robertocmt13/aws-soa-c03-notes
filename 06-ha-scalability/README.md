@@ -2,8 +2,8 @@
 
 Notas de la Sección 6 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 50 a 53 completadas: escalabilidad, alta disponibilidad,
-> Elastic Load Balancing y Application Load Balancer (teoría).
+> Sección en curso. Lecciones 50 a 55 completadas: escalabilidad, alta disponibilidad,
+> Elastic Load Balancing y Application Load Balancer (teoría y práctica).
 
 ---
 
@@ -298,6 +298,165 @@ defecto el ALB no la sustituye, sino que **añade la IP real al final**. El valo
 
 ---
 
+## Práctica: ALB con dos instancias
+
+### Montaje
+
+Dos instancias `t3.micro` lanzadas a la vez desde el asistente, con este **user data** para que
+cada una sirva su propio hostname y se distinga a cuál responde el balanceador:
+
+```bash
+#!/bin/bash
+yum update -y
+yum install -y httpd
+systemctl start httpd
+systemctl enable httpd
+echo "<h1>Hello World from $(hostname -f)</h1>" > /var/www/html/index.html
+```
+
+Al pedir más de una instancia, el asistente avisa: *"When launching more than 1 instance, consider
+EC2 Auto Scaling"*. No es un error, es el recordatorio de que el patrón real de producción es
+**ASG + load balancer**, no instancias sueltas.
+
+Orden de creación:
+
+1. **Security group para el ALB** (`demo-sg-load-balancer`): entrada HTTP:80 desde `0.0.0.0/0`.
+2. **Target group** (`demo-tg-alb`): tipo *Instances*, protocolo HTTP, puerto 80, y registro de
+   las dos instancias.
+3. **ALB** (`DemoALB`): esquema *Internet-facing*, el security group anterior y un listener
+   HTTP:80 que reenvía al target group.
+
+El ALB exige **al menos dos Availability Zones** — lo dice el propio formulario de *Network
+mapping*. Es la materialización de que un balanceador sin varias AZs no da alta disponibilidad.
+
+### Resultado
+
+El ALB entrega un **hostname**, no una IP:
+
+```
+http://demoalb-1744094106.eu-north-1.elb.amazonaws.com/
+```
+
+Recargando, la respuesta alterna entre las dos instancias.
+
+### Unused frente a Unhealthy
+
+Al **parar** una de las instancias, el target group la marca como `Unused`, con el detalle
+*"Target is in the stopped state"*, y el ALB deja de mandarle tráfico: a partir de ahí la URL
+devuelve siempre el mismo `Hello World`.
+
+Son dos estados distintos y el examen los diferencia:
+
+| Estado | Qué significa |
+|---|---|
+| **Unused** | El destino está registrado pero **parado o terminado**. Ni se intenta el health check |
+| **Unhealthy** | El destino está **corriendo** pero falla el chequeo: puerto cerrado, servicio caído, 5xx |
+
+Parar la instancia da `Unused`. Un `systemctl stop httpd` dejando la máquina encendida daría
+`Unhealthy`.
+
+Esto es el failover automático en funcionamiento: el health check es **activo y continuo**, el
+ALB lo lanza por su cuenta cada intervalo, y al detectar el fallo retira el destino sin que haya
+que tocar nada.
+
+---
+
+## Cadena de security groups
+
+El patrón de seguridad correcto para un ALB: **las instancias no aceptan tráfico de internet, solo
+del balanceador**.
+
+| Security group | Regla de entrada |
+|---|---|
+| Del **ALB** | HTTP:80 desde `0.0.0.0/0` |
+| De las **instancias** | HTTP:80 **con origen el security group del ALB**, no un CIDR |
+
+En el desplegable de *Source* de una regla se puede elegir un CIDR o **otro security group**. Al
+referenciar el SG del balanceador, la regla dice "acepto el puerto 80 de cualquier cosa que
+pertenezca a ese grupo", sin depender de IPs que cambian.
+
+### Comprobación
+
+Con la cadena montada:
+
+- La **URL del ALB sigue funcionando**.
+- Las **IPs públicas de las instancias dejan de responder**: el navegador se queda cargando hasta
+  dar `ERR_CONNECTION_TIMED_OUT`.
+
+El detalle del **timeout** importa en un diagnóstico: un security group **descarta el paquete en
+silencio**, y por eso el cliente espera hasta agotar el tiempo. Un `connection refused`
+inmediato significaría que el paquete sí llegó y que no había nada escuchando en ese puerto. Ver
+cuál de los dos se produce dice si el problema es de filtrado o de servicio.
+
+---
+
+## Reglas del listener
+
+Un listener tiene una **regla por defecto** (*"si ninguna otra aplica"*) y reglas adicionales que
+se evalúan antes.
+
+Práctica: regla `DemoRule` sobre el listener HTTP:80.
+
+| Campo | Valor |
+|---|---|
+| Condición | `Path` = `/error` |
+| Acción | *Return fixed response* |
+| Código | 404 |
+| Content type | `text/plain` |
+| Cuerpo | `Not Found, custom error` |
+| Prioridad | 5 |
+
+Resultado: `…elb.amazonaws.com/error` devuelve el texto personalizado, mientras que el resto de
+rutas siguen yendo al target group.
+
+### Prioridad
+
+Las reglas se evalúan **de menor a mayor número**, y la regla `Default` **siempre va la última**.
+Su prioridad no se puede cambiar. Con dos reglas no se nota, pero en cuanto hay varias
+condiciones que podrían coincidir, el orden decide cuál gana.
+
+### Las tres acciones posibles
+
+| Acción | Qué hace |
+|---|---|
+| **Forward to target group** | Reenvía a los destinos. Es lo habitual |
+| **Redirect to URL** | Devuelve una redirección. Es lo que se usa para HTTP → HTTPS |
+| **Return fixed response** | **El propio ALB genera la respuesta**, sin tocar el backend |
+
+La tercera es la base de las páginas de mantenimiento y de los bloqueos por ruta sin desplegar
+nada en las instancias.
+
+Límites que muestra la consola: 100 reglas por ALB, 5 valores de condición por regla, 6 comodines
+por regla y 5 target groups ponderados por regla.
+
+---
+
+## Limpieza de la práctica
+
+Hay dependencias, así que el orden no es opcional:
+
+| # | Recurso | ¿Factura? | Nota |
+|---|---|---|---|
+| 1 | **Load balancer** | **Sí, por hora**, reciba tráfico o no | Primero. Mientras exista, bloquea lo demás |
+| 2 | **Target group** | No | Solo se puede borrar cuando ningún listener lo referencia |
+| 3 | **Instancias EC2** | **Sí** | Terminar |
+| 4 | **Security group del ALB** | No | No se deja borrar mientras el ALB exista |
+| 5 | Regla añadida al SG de las instancias | No | Quitarla si se va a reutilizar ese SG |
+
+> El load balancer es el primer recurso del curso que **factura por hora solo por existir**. Con
+> las instancias bastaba con terminarlas; aquí, un ALB olvidado un fin de semana se nota.
+
+### Borrado asíncrono del target group
+
+Justo después de borrar el ALB, el intento de borrar el target group falla con *"is currently in
+use by a listener or a rule"*, aunque la misma pantalla muestre `Load balancer: None associated`.
+
+No es un error: AWS **elimina los listeners y las reglas de forma asíncrona**, y durante un rato
+el target group sigue viendo una referencia a un listener que ya no existe. Se resuelve solo
+esperando un minuto y repitiendo el borrado.
+
+---
+
 ## Resumen para el examen
 
 | Concepto | Clave |
@@ -331,3 +490,12 @@ defecto el ALB no la sustituye, sino que **añade la IP real al final**. El valo
 | Destinos on-premises | Por IP privada, con VPN o Direct Connect |
 | Dirección del ALB | **Hostname fijo, no IP fija**. IP fija → NLB |
 | IP del cliente | `X-Forwarded-For` (más `X-Forwarded-Port` y `X-Forwarded-Proto`) |
+| ALB y Availability Zones | Exige **al menos dos AZs** en el network mapping |
+| Unused vs Unhealthy | Destino parado/terminado vs destino corriendo que falla el health check |
+| Cadena de security groups | El SG de las instancias permite el puerto **con origen el SG del ALB**, no un CIDR |
+| Timeout vs connection refused | El SG descarta en silencio (timeout); sin servicio escuchando hay refused inmediato |
+| Prioridad de reglas | Se evalúan de menor a mayor. La regla `Default` siempre va la última |
+| Acciones de una regla | Forward to target group, Redirect to URL, **Return fixed response** |
+| Return fixed response | La genera el propio ALB. Páginas de mantenimiento sin tocar el backend |
+| Coste del ALB | **Por hora solo por existir**, haya tráfico o no |
+| Orden de borrado | ALB → target group → security group. El target group tarda en liberarse (borrado asíncrono) |

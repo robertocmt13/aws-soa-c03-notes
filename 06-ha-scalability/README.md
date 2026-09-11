@@ -2,8 +2,8 @@
 
 Notas de la Sección 6 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 50 a 55 completadas: escalabilidad, alta disponibilidad,
-> Elastic Load Balancing y Application Load Balancer (teoría y práctica).
+> Sección en curso. Lecciones 50 a 57 completadas: escalabilidad, alta disponibilidad,
+> Elastic Load Balancing, Application Load Balancer y Network Load Balancer (teoría y práctica).
 
 ---
 
@@ -431,7 +431,7 @@ por regla y 5 target groups ponderados por regla.
 
 ---
 
-## Limpieza de la práctica
+## Limpieza de la práctica del ALB
 
 Hay dependencias, así que el orden no es opcional:
 
@@ -454,6 +454,154 @@ use by a listener or a rule"*, aunque la misma pantalla muestre `Load balancer: 
 No es un error: AWS **elimina los listeners y las reglas de forma asíncrona**, y durante un rato
 el target group sigue viendo una referencia a un listener que ya no existe. Se resuelve solo
 esperando un minuto y repitiendo el borrado.
+
+---
+
+## Network Load Balancer
+
+Balanceador de **capa 4 (TCP/UDP)**. No entiende HTTP: mueve conexiones sin mirar lo que va
+dentro.
+
+- Reenvía tráfico **TCP y UDP** a las instancias.
+- Soporta **millones de peticiones por segundo** con **latencia ultra baja**. Al no inspeccionar
+  el contenido, el trabajo por conexión es mínimo.
+- Tiene **una IP estática por AZ** y admite asignarle **Elastic IPs**.
+- Se elige para **rendimiento extremo, tráfico TCP o UDP**, o cuando hace falta una IP fija.
+
+### Una IP fija por AZ
+
+Es la gran diferencia con el ALB, que solo ofrece un hostname. La IP es **por AZ**: un NLB
+desplegado en tres AZs tiene tres IPs fijas, y su nombre DNS resuelve a ellas (la consola lo
+marca como *A Record*).
+
+En el *Network mapping* se elige, para cada AZ:
+
+| Opción | Qué da |
+|---|---|
+| **Assigned by AWS** | IP fija durante toda la vida del NLB. Es la opción por defecto. Se libera al borrar el NLB |
+| **Use an Elastic IP address** | Una IP reservada en la cuenta. Sobrevive a borrar el NLB y se puede asociar a otro nuevo |
+
+En la práctica la opción de Elastic IP aparecía deshabilitada porque no tenía ninguna reservada.
+
+**Cuándo importa: whitelisting.** El caso típico es alguien que **se conecta a tu servicio** y
+tiene que dar de alta tu IP como destino en su firewall: un partner B2B que envía pedidos a tu
+API, o un cliente corporativo cuyo firewall solo permite conexiones salientes hacia IPs
+autorizadas. Con un ALB no hay IP que darle; con un NLB, sí.
+
+> La IP del NLB es de **entrada**. Si es el partner quien filtra las conexiones que **tú le haces
+> a él**, lo que ve es la IP de salida de tus instancias (o la de un NAT Gateway), y el NLB no
+> interviene.
+
+### IP fija del NLB frente a la IP failover de OVH
+
+La IP failover de OVH era fija y yo decidía qué servidor la tenía. En las migraciones de hardware
+preparaba el servidor nuevo en segundo plano, movía la IP y el DNS ni se enteraba. El concepto de
+fondo es el mismo: **desacoplar la IP pública del servidor que responde detrás**. Cambia quién
+hace el cambio y cuándo.
+
+| | IP failover (OVH) | Elastic IP | IP del NLB |
+|---|---|---|---|
+| Asociada a | Un servidor | Una instancia | El balanceador, en una AZ |
+| Servidores activos detrás | Uno | Uno | Todos los del target group |
+| Quién cambia el destino | Yo, a mano | Yo, a mano o por API | Los health checks, automáticamente |
+| Cuándo | Evento planificado | Evento planificado | De forma continua, en segundos |
+
+El equivalente directo de la IP failover en AWS es la **Elastic IP**. El NLB va un paso más allá:
+su IP no salta nunca, porque el failover ocurre por debajo, entre los destinos.
+
+### Target groups
+
+Los destinos de un NLB pueden ser:
+
+| Tipo de destino | Detalle |
+|---|---|
+| Instancias EC2 | Igual que en el ALB |
+| Direcciones IP | Tienen que ser **privadas**: alcanzables desde la VPC, por ejemplo servidores on-premises con VPN o Direct Connect |
+| **Application Load Balancer** | Permite encadenar NLB → ALB |
+
+Los health checks admiten **TCP, HTTP y HTTPS**.
+
+**El protocolo del target group no es HTTP.** Un target group de NLB se configura con protocolos
+de capa 4 (TCP, UDP, TLS…). Cuando el diagrama del curso pone "HTTP" en la flecha hacia un target
+group, significa que esa aplicación habla HTTP dentro de la conexión TCP: el NLB la transporta sin
+interpretarla. Lo que sí puede ser HTTP es el **health check**: el target group es TCP, pero el
+chequeo puede pedir una ruta por HTTP y comprobar el código de respuesta.
+
+### NLB delante de un ALB
+
+El cliente llega por la IP fija del NLB, el NLB reenvía la conexión TCP al ALB, y el ALB aplica
+sus reglas de capa 7 (ruta, hostname, cabeceras) como siempre. Es la forma de tener **IP fija y
+enrutamiento HTTP a la vez**, algo que ninguno de los dos da por separado.
+
+### Security groups en el NLB
+
+Durante años el NLB no admitía security groups. Ahora sí, pero **solo si se asocian al crearlo**:
+un NLB creado sin security group no puede recibirlos después. Con SG, la cadena es la misma que
+con el ALB.
+
+---
+
+## Práctica: NLB con dos instancias
+
+Mismo montaje que la práctica del ALB: dos instancias `t3.micro` con el mismo user data, cada
+una sirviendo su hostname.
+
+Orden de creación:
+
+1. **Security group para el NLB** (`demo-sg-nlb`): entrada HTTP:80 desde `0.0.0.0/0`.
+2. **Instancias**, con el SG `launch-wizard-1` (SSH:22 y HTTP:80 desde `0.0.0.0/0`). Con el 80
+   abierto se comprueba antes, por la IP pública, que httpd responde en cada instancia.
+3. **Target group** (`demo-tg-nlb`): tipo *Instances*, protocolo **TCP**, puerto 80, con las dos
+   instancias registradas.
+4. **NLB** (`DemoNLB`): *Internet-facing*, IPv4, VPC por defecto, tres AZs (`eu-north-1a`, `1b` y
+   `1c`) con IP asignada por AWS, el SG `demo-sg-nlb` y un listener **TCP:80** que reenvía a
+   `demo-tg-nlb`.
+5. **Cadena de security groups**: en `launch-wizard-1`, la regla HTTP:80 pasa a tener como origen
+   `demo-sg-nlb` en lugar de `0.0.0.0/0`.
+
+Error que cometí en el paso 1: metí la regla HTTP:80 en **Outbound** en lugar de Inbound. La
+pantalla de creación del SG ya trae una regla de salida y es fácil acabar editando esa. La pista
+estaba en el propio formulario: *"This security group has no inbound rules"*.
+
+### Resultado
+
+```
+http://demonlb-70ff368268ca5228.elb.eu-north-1.amazonaws.com/
+```
+
+Los dos destinos aparecen `Healthy` y la respuesta alterna entre `ip-172-31-34-9` e
+`ip-172-31-47-76`, pero **no en cada recarga**: hacía falta esperar un rato.
+
+Es el comportamiento esperado de un balanceador de capa 4. El NLB reparte **conexiones TCP, no
+peticiones HTTP**, y todo lo que viaja por una misma conexión va al mismo destino. El navegador
+reutiliza la conexión (keep-alive) entre recargas, así que sigue cayendo en la misma instancia
+hasta que la conexión se cierra. El ALB, en cambio, termina la conexión y decide el destino
+**en cada petición**, por eso allí alternaba en cada recarga.
+
+### Diferencias con la práctica del ALB
+
+| | ALB | NLB |
+|---|---|---|
+| Listener | HTTP:80 | TCP:80 |
+| Target group | HTTP | TCP |
+| Reglas del listener | Ruta, hostname, cabeceras, fixed response | Solo reenviar al target group (admite varios con pesos) |
+| Network mapping | Subredes | Subredes y, por AZ, IP asignada por AWS o Elastic IP |
+| Unidad de reparto | Petición HTTP | Conexión TCP |
+
+---
+
+## Limpieza de la práctica del NLB
+
+| # | Recurso | ¿Factura? | Nota |
+|---|---|---|---|
+| 1 | **NLB** | **Sí, por hora**, más una parte por uso (NLCU) | Primero |
+| 2 | Target group | No | |
+| 3 | **Instancias EC2** | **Sí** | Terminar |
+| 4 | Regla del SG de las instancias que referencia `demo-sg-nlb` | No | Quitarla antes del paso 5 |
+| 5 | Security group del NLB | No | |
+
+Un security group **referenciado por una regla de otro SG no se puede borrar**. Hay que quitar
+antes esa referencia, igual que el SG del ALB no se deja borrar mientras el ALB exista.
 
 ---
 
@@ -499,3 +647,13 @@ esperando un minuto y repitiendo el borrado.
 | Return fixed response | La genera el propio ALB. Páginas de mantenimiento sin tocar el backend |
 | Coste del ALB | **Por hora solo por existir**, haya tráfico o no |
 | Orden de borrado | ALB → target group → security group. El target group tarda en liberarse (borrado asíncrono) |
+| NLB | Capa 4: TCP y UDP. Millones de peticiones por segundo, latencia ultra baja |
+| IP del NLB | **Una IP estática por AZ**. Admite Elastic IP |
+| Whitelisting por IP | NLB. El ALB solo da hostname |
+| Destinos del NLB | EC2, IPs **privadas** y **ALB** |
+| Health checks del NLB | TCP, HTTP y HTTPS |
+| Protocolo del target group del NLB | Capa 4 (TCP, UDP, TLS…), nunca HTTP |
+| IP fija + reglas HTTP | NLB delante de un ALB |
+| Security groups en el NLB | Solo si se asocian al crearlo |
+| Unidad de reparto | ALB: cada petición HTTP. NLB: cada conexión TCP |
+| Borrar un SG referenciado | No se puede: quitar antes la regla que lo referencia |

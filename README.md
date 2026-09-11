@@ -20,7 +20,7 @@ qué no, y cómo se relaciona con lo que ya venía haciendo en producción.
 | [EC2 Hibernate](./ec2-hibernate/) | Conservación del estado de RAM, requisitos y comparativa con reboot y stop/start |
 | [04 - AMI](./04-ami/) | AMI, no reboot, migración entre regiones y AZs, cross-account sharing y copy, EC2 Image Builder, AMI in production |
 | [05 - Systems Manager](./05-ssm/) | SSM Agent y requisitos, tags y resource groups, documents y Run Command, Automation, Parameter Store, Fleet Manager, DHMC, Inventory, State Manager, Patch Manager, Maintenance Windows, Session Manager, Distributor y OpsCenter |
-| [06 - HA y escalabilidad](./06-ha-scalability/) | Escalado vertical y horizontal, alta disponibilidad frente a DR, Elastic Load Balancing, tipos de load balancer, ALB: target groups, reglas de enrutamiento, cadena de security groups y práctica completa *(en curso)* |
+| [06 - HA y escalabilidad](./06-ha-scalability/) | Escalado vertical y horizontal, alta disponibilidad frente a DR, Elastic Load Balancing, tipos de load balancer, ALB: target groups, reglas de enrutamiento, cadena de security groups y práctica completa, NLB: IP fija por AZ, target groups, NLB delante de ALB y práctica *(en curso)* |
 
 ## Contexto
 

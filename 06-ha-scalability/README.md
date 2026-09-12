@@ -2,8 +2,9 @@
 
 Notas de la Sección 6 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 50 a 57 completadas: escalabilidad, alta disponibilidad,
-> Elastic Load Balancing, Application Load Balancer y Network Load Balancer (teoría y práctica).
+> Sección en curso. Lecciones 50 a 60 completadas: escalabilidad, alta disponibilidad,
+> Elastic Load Balancing, Application Load Balancer y Network Load Balancer (teoría y práctica),
+> Gateway Load Balancer, Sticky Sessions y Cross-Zone Load Balancing (teoría).
 
 ---
 
@@ -605,6 +606,95 @@ antes esa referencia, igual que el SG del ALB no se deja borrar mientras el ALB 
 
 ---
 
+## Gateway Load Balancer
+
+Balanceador de **capa 3 (paquetes IP)**, pensado para meter appliances de seguridad de
+**terceros** (firewalls, IDS/IPS, deep packet inspection) delante de una aplicación sin
+rediseñar la red.
+
+- Combina dos funciones: **Transparent Network Gateway** (punto único de entrada/salida para
+  todo el tráfico) y **Load Balancer** (reparte ese tráfico entre los appliances).
+- El tráfico **no va dirigido al GWLB**: la route table de la subred lo desvía de forma
+  transparente hacia él antes de que llegue a su destino real. El appliance decide si el paquete
+  pasa o se descarta y, si pasa, se lo devuelve al GWLB, que lo reenvía al destino original. La
+  aplicación nunca sabe que ese desvío existió.
+- Usa el protocolo **GENEVE** por el puerto **6081**: encapsula el paquete original (con
+  metadatos de origen/destino) para mandarlo al appliance, que lo desencapsula, decide, y lo
+  vuelve a encapsular para devolverlo.
+- Los destinos tienen que ser **appliances comerciales ya preparados para hablar GENEVE**
+  (Palo Alto, Fortinet, Check Point…), normalmente del AWS Marketplace. Un `iptables` o un
+  `fail2ban` normales no valen: no saben desencapsular GENEVE, y además trabajan a nivel de
+  aplicación/logs, no de paquete IP.
+- Sin hands-on en el curso: montar un appliance de verdad no es viable con recursos gratuitos.
+
+---
+
+## Sticky Sessions (Session Affinity)
+
+Consigue que un mismo cliente vaya siempre a la misma instancia detrás del balanceador. Útil
+para no perder datos de sesión que solo vive en una instancia (caché local, carrito en memoria).
+Funciona en **CLB, ALB y NLB**, pero cada uno lo resuelve de forma distinta.
+
+### ALB y CLB: por cookie
+
+El balanceador inserta una cookie que el navegador devuelve en cada petición siguiente.
+
+| Tipo de cookie | Quién la genera | Nombre | Duración |
+|---|---|---|---|
+| Duration-based | El load balancer | `AWSALB` (ALB) / `AWSELB` (CLB) | **7 días fijos, no configurable** |
+| Application cookie | El target (tu app) | Lo eliges tú (no puede ser `AWSALB`, `AWSALBAPP` ni `AWSALBTG`, reservados) | La decide tu app |
+| Application-based (auto) | El load balancer, imitando a una cookie de tu app | `AWSALBAPP` | — |
+
+Con stickiness activo en la práctica del ALB, el navegador manda siempre la misma cookie y el
+ALB la respeta: se vería la misma instancia en cada recarga, en vez de alternar como en la
+práctica que hicimos.
+
+### NLB: sin cookies, por IP de origen
+
+El NLB opera en capa 4 y no puede leer ni insertar nada en el tráfico. Para conseguir
+pegajosidad usa lo que ya tiene disponible de cada conexión: la **IP de origen del cliente**
+(más el puerto), sobre la que aplica un hash para mandar siempre esa combinación al mismo
+target. Consecuencia a tener en cuenta: varios clientes detrás del mismo NAT (una oficina
+entera saliendo por la misma IP pública) caen todos en la misma instancia.
+
+### Dependencias en el target group
+
+- Stickiness **no se puede activar si Cross-zone load balancing está apagado**.
+- No es compatible con el algoritmo de enrutamiento **Weighted random**.
+
+---
+
+## Cross-Zone Load Balancing
+
+Decide si cada nodo del load balancer reparte tráfico entre **todas** las instancias de **todas**
+las AZs habilitadas, o solo entre las de su propia AZ.
+
+- **Con cross-zone**: cada nodo reparte su parte de tráfico por igual entre el total de instancias
+  de todas las AZs, sin importar en cuál esté cada una.
+- **Sin cross-zone**: cada nodo solo reparte entre las instancias de su propia AZ. Si una AZ tiene
+  menos instancias que otra, esas cargan más tráfico por instancia que las de la AZ con más
+  instancias.
+
+### Por defecto y coste, según el tipo de balanceador
+
+| Load balancer | Por defecto | Coste de datos inter-AZ si se activa |
+|---|---|---|
+| Application Load Balancer | **On** (se puede apagar a nivel de target group, no a nivel del ALB) | Sin coste |
+| Network Load Balancer / Gateway Load Balancer | **Off** | **Con coste ($)** |
+| Classic Load Balancer | Off | Sin coste si se activa |
+
+El target group de un ALB tiene tres opciones: heredar el ajuste del balancer (por defecto,
+hereda On), o forzarlo a On/Off explícitamente.
+
+### Por qué apagarlo pese al desequilibrio
+
+No es una cuestión de separar entornos (prod y dev nunca comparten balanceador). El motivo real
+es el **coste de datos inter-AZ** en NLB/GWLB: si mantienes el mismo número de instancias en
+cada AZ (típico con un Auto Scaling Group repartido a partes iguales), el desequilibrio de
+tráfico entre AZs desaparece y te ahorras esa factura sin perder nada.
+
+---
+
 ## Resumen para el examen
 
 | Concepto | Clave |
@@ -657,3 +747,14 @@ antes esa referencia, igual que el SG del ALB no se deja borrar mientras el ALB 
 | Security groups en el NLB | Solo si se asocian al crearlo |
 | Unidad de reparto | ALB: cada petición HTTP. NLB: cada conexión TCP |
 | Borrar un SG referenciado | No se puede: quitar antes la regla que lo referencia |
+| GWLB, capa | 3 (paquetes IP) |
+| GWLB, protocolo hacia el appliance | GENEVE, puerto 6081 |
+| Appliances del GWLB | Productos de terceros ya compatibles con GENEVE, no `iptables` casero |
+| Sticky sessions, dónde funciona | CLB, ALB y NLB |
+| Cookie `AWSALB`/`AWSELB` (duration-based) | 7 días fijos, no configurable |
+| Cookie reservada, no usar | `AWSALB`, `AWSALBAPP`, `AWSALBTG` |
+| Sticky sessions en NLB | Por IP de origen (hash), no por cookie |
+| Stickiness incompatible con | Cross-zone apagado, y con el algoritmo Weighted random |
+| Cross-zone por defecto | ALB: On (target group puede apagarlo). NLB/GWLB: Off. CLB: Off |
+| Cross-zone, coste inter-AZ | Solo en NLB/GWLB si se activa |
+| Cross-zone apagado en ALB | No se puede a nivel de balanceador, sí a nivel de target group |

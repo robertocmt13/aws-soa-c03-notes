@@ -2,9 +2,11 @@
 
 Notas de la Sección 6 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 50 a 60 completadas: escalabilidad, alta disponibilidad,
+> Sección en curso. Lecciones 50 a 67 completadas: escalabilidad, alta disponibilidad,
 > Elastic Load Balancing, Application Load Balancer y Network Load Balancer (teoría y práctica),
-> Gateway Load Balancer, Sticky Sessions y Cross-Zone Load Balancing (teoría).
+> Gateway Load Balancer, Sticky Sessions, Cross-Zone Load Balancing, certificados SSL y SNI,
+> Deregistration Delay, health checks, monitorización y troubleshooting, atributos del target
+> group y reglas del ALB.
 
 ---
 
@@ -695,6 +697,332 @@ tráfico entre AZs desaparece y te ahorras esa factura sin perder nada.
 
 ---
 
+## Certificados SSL en el load balancer
+
+El balanceador usa un **certificado X.509** (certificado de servidor SSL/TLS) para terminar el
+HTTPS. El patrón normal es:
+
+```
+Usuario  --HTTPS (cifrado, por internet)-->  Load Balancer  --HTTP (VPC privada)-->  EC2
+```
+
+El tráfico entre el balanceador y las instancias va **sin cifrar** porque circula dentro de la
+VPC. La excepción es el cumplimiento normativo: con PCI-DSS o similares puede exigirse cifrado
+extremo a extremo, y entonces el tramo interno también va por HTTPS (*re-encryption*). No es lo
+habitual, pero conviene tenerlo presente en una tienda online.
+
+### De dónde sale el certificado
+
+| Origen | Detalle |
+|---|---|
+| **ACM** (AWS Certificate Manager) | Lo emite y **renueva AWS**. Es la opción por defecto |
+| **Importado** | Certificado propio o de un tercero, subido a ACM |
+| **Desde IAM** | Opción heredada, todavía presente en el formulario del listener |
+
+### Configuración del listener HTTPS
+
+- Hay que especificar un **certificado por defecto**, obligatorio. Es el que se usa si el cliente
+  no manda SNI o si ningún certificado de la lista coincide.
+- Se puede añadir una **lista opcional de certificados** para servir varios dominios.
+- Los clientes usan **SNI** para indicar a qué hostname quieren llegar.
+- Se elige una **security policy**, que fija qué versiones y cifrados de SSL/TLS se aceptan. Sirve
+  para dar soporte a clientes antiguos (*legacy clients*).
+
+### SNI (Server Name Indication)
+
+Resuelve el problema de cargar **varios certificados SSL en un mismo servidor web** para servir
+varios sitios.
+
+El cliente indica el **hostname de destino dentro del ClientHello del handshake TLS**, antes de
+que exista ninguna petición HTTP y antes de que la conexión esté cifrada. El servidor busca el
+certificado que corresponde a ese hostname y, si no encuentra ninguno, devuelve el certificado
+por defecto.
+
+Detalle de capa que conviene no mezclar: SNI viaja en la **capa TLS**, no en la capa HTTP. Lo que
+manda el cliente es solo el dominio, sin ruta ni parámetros.
+
+| Load balancer | Certificados SSL |
+|---|---|
+| **CLB** (v1) | **Uno solo**. Para varios hostnames con varios certificados hacen falta varios CLB |
+| **ALB** (v2) | **Varios listeners con varios certificados**, mediante SNI |
+| **NLB** (v2) | **Varios listeners con varios certificados**, mediante SNI |
+
+SNI funciona en **ALB, NLB y CloudFront**. **No funciona en CLB**, que es de la generación
+anterior.
+
+### ACM frente a Let's Encrypt
+
+| | Let's Encrypt (Certbot / panel) | ACM |
+|---|---|---|
+| Validación por DNS | Registro **TXT** | Registro **CNAME** |
+| Caducidad | 90 días | — |
+| Renovación | Hay que renovar (cron, o lo gestiona el panel) | **Automática y sin corte** |
+| Condición para renovar | — | Que el certificado esté **en uso** por un recurso integrado |
+| Dónde vive el certificado | En el servidor web | En ACM, asociado al balanceador |
+
+La diferencia real no es el método de validación, sino que ACM se encarga de la renovación. El
+matiz de examen: un certificado de ACM que **no está asociado a ningún recurso no se renueva
+solo**.
+
+### Coste
+
+Los certificados **públicos de ACM son gratuitos** si se usan en un recurso integrado de AWS
+(ALB, CloudFront, API Gateway). Lo que cuesta dinero es **ACM Private CA**, para PKI interna, que
+no interviene aquí.
+
+---
+
+## Práctica de SSL: por qué no se completa
+
+La práctica del curso monta el listener HTTPS:443 sobre el ALB ya existente, con el target group
+`demo-tg-alb` y la security policy recomendada, pero **se cancela antes de guardar**.
+
+El motivo está en el propio formulario: el desplegable **Certificate (from ACM)** aparece vacío.
+Un listener HTTPS **exige un certificado por defecto** y no deja continuar sin él. Para pedir un
+certificado público en ACM hace falta **un dominio propio y validarlo**, así que sin dominio la
+práctica no se puede terminar.
+
+Alternativas si se quisiera ver el HTTPS funcionando:
+
+- **Import certificate**: subir a ACM un certificado autofirmado generado con `openssl`. El
+  navegador avisa de que no es de confianza, pero el listener se crea y el handshake TLS es real.
+- Validar un dominio propio **en el DNS que sea**: ACM no obliga a usar Route 53. Basta con
+  añadir el CNAME de validación donde esté alojada la zona.
+
+> Lo aprovechable de montar el entorno igualmente: queda comprobado de primera mano que el
+> bloqueo es la falta de dominio, no un tema de coste.
+
+---
+
+## Deregistration Delay (Connection Draining)
+
+Es el tiempo que el balanceador **espera a que terminen las peticiones en curso** (*in-flight
+requests*) cuando un destino se está dando de baja o está *unhealthy*.
+
+| Nombre de la funcionalidad | Balanceador |
+|---|---|
+| **Connection Draining** | CLB |
+| **Deregistration Delay** | **ALB y NLB** |
+
+Como el CLB está deprecated, el nombre que se usa siempre es **Deregistration Delay**.
+
+Cómo funciona:
+
+- Deja de mandar **peticiones nuevas** al destino que se está dando de baja.
+- Espera a que las conexiones ya abiertas terminen su trabajo.
+- Rango: **de 1 a 3600 segundos**, con **300 segundos por defecto**.
+- Se puede **desactivar poniéndolo a 0**.
+- Conviene un valor **bajo** si las peticiones son cortas.
+
+No es que el balanceador reparta nada distinto: lo que hace es **proteger las peticiones ya en
+curso** cuando una instancia se va, ya sea por baja manual, por fallar los health checks o porque
+un Auto Scaling Group la retira en un *scale-in*. Sin este margen, esas conexiones se cortarían
+en seco a mitad de petición.
+
+---
+
+## Health Checks
+
+### Estados de un destino
+
+| Estado | Qué significa |
+|---|---|
+| **Initial** | Se está registrando el destino |
+| **Healthy** | Pasa los chequeos |
+| **Unhealthy** | Falla los chequeos |
+| **Unused** | El destino no está registrado |
+| **Draining** | Se está dando de baja el destino |
+| **Unavailable** | Los health checks están desactivados |
+
+### Parámetros
+
+| Ajuste | Valor por defecto | Qué hace |
+|---|---|---|
+| `HealthCheckProtocol` | HTTP | Protocolo del chequeo (HTTP o HTTPS) |
+| `HealthCheckPort` | 80 | Puerto del chequeo |
+| `HealthCheckPath` | `/` | **Ruta de destino, configurable** |
+| `HealthCheckTimeoutSeconds` | 5 | Se da por fallado si no responde en ese tiempo |
+| `HealthCheckIntervalSeconds` | 30 | Cada cuánto se lanza el chequeo |
+| `HealthyThresholdCount` | 3 | Chequeos correctos seguidos para marcarlo *healthy* |
+| `UnhealthyThresholdCount` | 5 | Chequeos fallidos seguidos para marcarlo *unhealthy* |
+
+El **intervalo tiene que ser mayor o igual que el timeout**: si no, se lanzaría el chequeo
+siguiente antes de que terminase el anterior.
+
+### Ruta personalizada
+
+La ruta del health check **no tiene que ser la raíz**. Se puede apuntar a un endpoint propio
+(`/health`, `/testhealth`) y hay dos motivos para hacerlo:
+
+- Evitar que el chequeo pegue contra una raíz pesada. En tiendas PrestaShop es fácil encontrar un
+  index que carga catálogo e imágenes sin optimizar.
+- Tener un endpoint **dedicado** que compruebe las dependencias reales (base de datos, caché) y
+  devuelva un 200 ligero, desacoplado del contenido de negocio.
+
+### Cuando todos los destinos están unhealthy
+
+Si un target group **solo contiene destinos unhealthy**, el ELB enruta las peticiones **entre
+esos destinos unhealthy** de todos modos.
+
+La diapositiva lo llama explícitamente un escenario de **best effort**: el balanceador no
+garantiza que la petición vaya a funcionar, simplemente prefiere intentarlo con algo antes que
+devolver un error a todos los usuarios. Es el último recurso, no una garantía de servicio. El
+caso típico es que la configuración del propio health check esté mal y en realidad la aplicación
+funcione.
+
+---
+
+## Monitorización y troubleshooting del ELB
+
+Todas las métricas del load balancer se publican **directamente en CloudWatch**.
+
+### Códigos de error y qué mirar
+
+| Código | Significado | Dónde mirar |
+|---|---|---|
+| **HTTP 400** Bad Request | El cliente mandó una petición malformada que no cumple la especificación HTTP | — |
+| **HTTP 503** Service Unavailable | **No hay destinos sanos** en alguna de las AZs en las que el balanceador está configurado para responder | `HealthyHostCount` en CloudWatch |
+| **HTTP 504** Gateway Timeout | Expiró el tiempo de espera | Revisar el **keep-alive** de las instancias: su timeout tiene que ser **mayor** que el *idle timeout* del balanceador |
+
+El 503 no es "una instancia que tarda en arrancar": es que **faltan destinos sanos donde
+enrutar**. Una instancia que responde tarde daría más bien un 504.
+
+### Métricas: la nomenclatura del curso está heredada del CLB
+
+La diapositiva de monitorización dibuja un **ALB**, pero lista las métricas con los nombres
+antiguos del **CLB**. Los nombres reales que aparecen hoy en CloudWatch para un ALB son otros:
+
+| En la diapositiva (CLB) | Nombre real en ALB |
+|---|---|
+| `BackendConnectionErrors` | `TargetConnectionErrorCount` |
+| `HTTPCode_Backend_2XX` / `3XX` / `4XX` / `5XX` | `HTTPCode_Target_2XX_Count` / `_3XX_Count` / `_4XX_Count` / `_5XX_Count` |
+| `HTTPCode_ELB_4XX` / `HTTPCode_ELB_5XX` | `HTTPCode_ELB_4XX_Count` / `HTTPCode_ELB_5XX_Count` (con sufijo `_Count`) |
+| `Latency` | `TargetResponseTime` |
+| `SurgeQueueLength` / `SpilloverCount` | **No existen en ALB** |
+
+`RequestCount`, `RequestCountPerTarget`, `HealthyHostCount` y `UnHealthyHostCount` se llaman
+igual en ambos.
+
+Qué mide cada una:
+
+| Métrica | Qué indica |
+|---|---|
+| `HealthyHostCount` / `UnHealthyHostCount` | Destinos sanos y no sanos. Es la métrica del 503 |
+| `HTTPCode_ELB_4XX_Count` | Errores de cliente **generados por el balanceador** |
+| `HTTPCode_ELB_5XX_Count` | Errores de servidor **generados por el balanceador**, no por los destinos |
+| `HTTPCode_Target_XXX_Count` | Códigos generados por **los destinos**. No incluye los del balanceador |
+| `RequestCount` | Peticiones totales |
+| `RequestCountPerTarget` | **Media de peticiones por destino**. Buena señal de si toca escalar, y es la métrica que se usa como objetivo en las políticas de *target tracking* del ASG |
+| `TargetResponseTime` | Tiempo de respuesta de los destinos |
+
+### SurgeQueueLength y SpilloverCount: solo CLB
+
+Las dos aparecen en la diapositiva, pero son **exclusivas del Classic Load Balancer**:
+
+- **`SurgeQueueLength`**: número total de peticiones (listener HTTP) o conexiones (listener TCP)
+  pendientes de ruta hacia una instancia sana. El **máximo de la cola es 1024**. Cuanto más cerca
+  de 0, mejor.
+- **`SpilloverCount`**: peticiones **rechazadas por tener la cola llena**.
+
+El ALB no encola peticiones de esa forma, así que estas dos métricas no existen ahí. Para saber
+si hay que escalar en un ALB, lo que se mira es `RequestCountPerTarget` y `TargetResponseTime`.
+
+Lo importante, en cualquier caso: **poner alarmas**, no mirar gráficas a mano.
+
+### Access Logs
+
+- Registran **todas las peticiones** que pasan por el balanceador.
+- Se almacenan en **S3**, cifrados.
+- Solo se paga el **almacenamiento de S3**, no la funcionalidad.
+
+### Request Tracing
+
+El balanceador añade la cabecera **`X-Amzn-Trace-Id`** a cada petición, lo que permite correlar
+una misma petición entre los logs del balanceador y los de la aplicación.
+
+---
+
+## Atributos del target group
+
+### Slow Start Mode
+
+Cuando se registra un destino **nuevo** en el target group, se le va aumentando la proporción de
+tráfico **de forma gradual** durante un periodo de calentamiento configurable, en lugar de darle
+su cuota completa desde el primer segundo.
+
+Sirve para que una instancia recién arrancada (por ejemplo, la que acaba de lanzar un ASG en un
+*scale-out*) tenga tiempo de calentar cachés y conexiones antes de recibir su parte entera. El
+resto de destinos siguen recibiendo tráfico con normalidad mientras tanto.
+
+### Algoritmos de enrutamiento
+
+| Algoritmo | Dónde aplica | Cómo reparte |
+|---|---|---|
+| **Round Robin** | ALB (HTTP/HTTPS) — es el **por defecto**. También CLB con listener TCP | Por orden, uno detrás de otro, y vuelta a empezar |
+| **Least Outstanding Requests** | ALB (HTTP/HTTPS) y CLB (HTTP/HTTPS) | Manda cada petición nueva al destino con **menos peticiones en curso** |
+| **Flow Hash** | **NLB** | Calcula un hash de la conexión y lo usa para elegir destino |
+| **Weighted Random** | ALB | Reparto aleatorio ponderado. **Incompatible con stickiness** |
+
+**Least Outstanding Requests**: útil cuando las peticiones no cuestan lo mismo o los destinos no
+tienen la misma capacidad. Si una instancia termina antes que otra, la siguiente petición se va a
+la que está más libre, en vez de respetar el turno.
+
+**Round Robin en ALB y en CLB no es lo mismo.** El ALB **nunca tiene listeners TCP**: solo
+HTTP, HTTPS, WebSocket y HTTP/2. Cuando el curso agrupa "ALB y CLB (TCP)" se refiere a dos
+contextos distintos: Round Robin es el algoritmo por defecto del ALB en sus listeners
+HTTP/HTTPS, y por separado es el que usa el CLB en sus listeners TCP.
+
+**Flow Hash (solo NLB)**: selecciona destino a partir de un hash calculado sobre el **protocolo,
+la IP de origen y destino, el puerto de origen y destino y el número de secuencia TCP**. Cada
+conexión TCP/UDP se enruta a **un único destino durante toda la vida de la conexión**.
+
+> El hash que aparece en el diagrama (`8743b…`) **no es tráfico cifrado del usuario**: es el
+> resultado de la función hash sobre esos campos de la conexión. Es un mecanismo determinista de
+> reparto, en la misma línea que el hash por IP de origen de las sticky sessions del NLB, pero con
+> más campos de entrada.
+
+---
+
+## ALB Rules: a fondo
+
+Complementa la [práctica de reglas del listener](#reglas-del-listener) hecha con `DemoRule`.
+
+- Las reglas se procesan **en orden**, y la regla `Default` va siempre la última. Con muchas
+  reglas, que una no se cumpla suele ser un problema de orden, no de condición.
+- Acciones soportadas: **forward**, **redirect** y **fixed-response**.
+
+### Condiciones disponibles
+
+| Condición | Sobre qué decide |
+|---|---|
+| `host-header` | La cabecera `Host` (el hostname pedido) |
+| `http-request-method` | GET, POST, PUT… |
+| `path-pattern` | La ruta de la URL |
+| `source-ip` | La IP de origen del cliente |
+| `http-header` | Cualquier cabecera HTTP |
+| `query-string` | Los parámetros de la query |
+
+### Target Group Weighting
+
+Una **misma regla** puede repartir tráfico entre **varios target groups**, cada uno con su
+**peso**.
+
+| Target Group | Peso | Tráfico |
+|---|---|---|
+| Target Group 1 (Blue) | 8 | 80 % |
+| Target Group 2 (Green) | 2 | 20 % |
+
+El caso de uso típico es el **despliegue blue/green** o convivir con varias versiones de la
+aplicación, controlando qué fracción de usuarios reales va a la versión nueva **sin tocar el DNS
+ni montar un segundo ALB**.
+
+Conviene no quedarse con la idea del primer diagrama (una regla → un target group): ese es el
+caso simple, no una restricción. El mecanismo ya aparecía en el formulario de creación del
+listener, con el botón **Add target group** y los campos **Weight** y **Percent**, aunque en su
+momento no se relacionara con este concepto.
+
+---
+
 ## Resumen para el examen
 
 | Concepto | Clave |
@@ -758,3 +1086,35 @@ tráfico entre AZs desaparece y te ahorras esa factura sin perder nada.
 | Cross-zone por defecto | ALB: On (target group puede apagarlo). NLB/GWLB: Off. CLB: Off |
 | Cross-zone, coste inter-AZ | Solo en NLB/GWLB si se activa |
 | Cross-zone apagado en ALB | No se puede a nivel de balanceador, sí a nivel de target group |
+| Certificado del load balancer | **X.509**. Desde ACM, importado, o desde IAM |
+| Listener HTTPS | **Certificado por defecto obligatorio** + lista opcional para varios dominios |
+| Security policy | Define versiones y cifrados de SSL/TLS aceptados. Para clientes antiguos |
+| SNI | El cliente indica el hostname **en el ClientHello del handshake TLS**, capa TLS, no HTTP |
+| SNI, dónde funciona | **ALB, NLB y CloudFront**. **No en CLB** |
+| Certificados por balanceador | CLB: **uno solo**. ALB y NLB: varios, con SNI |
+| ACM, renovación | **Automática**, pero solo si el certificado **está en uso** por un recurso |
+| Coste de ACM | Certificados públicos **gratis**. Lo que se paga es **ACM Private CA** |
+| Práctica de SSL | No se completa: sin dominio propio validado no hay certificado en ACM |
+| Connection Draining vs Deregistration Delay | Mismo concepto: CLB vs **ALB y NLB** |
+| Deregistration Delay | **1 a 3600 s, por defecto 300**. Se desactiva con 0. Bajo si las peticiones son cortas |
+| Qué protege el draining | Las peticiones **ya en curso** cuando un destino se da de baja o falla |
+| Estados del destino | Initial, Healthy, Unhealthy, Unused, Draining, **Unavailable** (checks desactivados) |
+| Health check, valores por defecto | Intervalo 30 s, timeout 5 s, healthy 3, unhealthy 5, path `/` |
+| Intervalo y timeout | El **intervalo ≥ timeout**, o se solaparían los chequeos |
+| Ruta del health check | **Configurable**. Mejor un endpoint dedicado y ligero que la raíz |
+| Target group todo unhealthy | El ELB enruta **entre los unhealthy** de todos modos. Escenario **best effort** |
+| HTTP 400 | Petición malformada del cliente |
+| HTTP 503 | **Sin destinos sanos** en alguna AZ configurada. Mirar `HealthyHostCount` |
+| HTTP 504 | Timeout. El **keep-alive** de la instancia debe superar el *idle timeout* del balanceador |
+| Nomenclatura de métricas | La diapositiva usa nombres de CLB. En ALB son `HTTPCode_Target_XXX_Count`, `TargetConnectionErrorCount`, `TargetResponseTime` |
+| `RequestCountPerTarget` | Media de peticiones por destino. Señal para escalar y objetivo de *target tracking* |
+| `SurgeQueueLength` / `SpilloverCount` | **Solo CLB**. Cola máxima 1024; el spillover son las rechazadas por cola llena |
+| Access Logs | En **S3**, cifrados. Solo se paga el almacenamiento |
+| Request Tracing | Cabecera **`X-Amzn-Trace-Id`** |
+| Slow Start Mode | Sube el tráfico **gradualmente** a un destino **recién registrado** |
+| Round Robin | **Por defecto en ALB** (HTTP/HTTPS). También CLB con listener TCP. El ALB no tiene listeners TCP |
+| Least Outstanding Requests | ALB y CLB (HTTP/HTTPS). Al destino con **menos peticiones en curso** |
+| Flow Hash | **Solo NLB**. Hash de protocolo, IPs, puertos y número de secuencia TCP |
+| Duración del Flow Hash | La conexión TCP/UDP entera va **al mismo destino** |
+| Condiciones de regla del ALB | `host-header`, `http-request-method`, `path-pattern`, `source-ip`, `http-header`, `query-string` |
+| Target Group Weighting | **Una regla, varios target groups con pesos**. Blue/green sin tocar DNS |

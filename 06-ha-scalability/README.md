@@ -2,11 +2,11 @@
 
 Notas de la Sección 6 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 50 a 67 completadas: escalabilidad, alta disponibilidad,
+> Sección en curso. Lecciones 50 a 69 completadas: escalabilidad, alta disponibilidad,
 > Elastic Load Balancing, Application Load Balancer y Network Load Balancer (teoría y práctica),
 > Gateway Load Balancer, Sticky Sessions, Cross-Zone Load Balancing, certificados SSL y SNI,
 > Deregistration Delay, health checks, monitorización y troubleshooting, atributos del target
-> group y reglas del ALB.
+> group y reglas del ALB, Auto Scaling Groups (teoría y práctica completa con ALB).
 
 ---
 
@@ -1023,6 +1023,92 @@ momento no se relacionara con este concepto.
 
 ---
 
+## Auto Scaling Groups (ASG)
+
+Automatizan lo que hasta ahora requería intervención manual: crear o destruir instancias EC2
+según la carga.
+
+- **Scale out**: añade instancias cuando sube la carga. **Scale in**: las retira cuando baja.
+- Garantiza un mínimo y un máximo de instancias corriendo.
+- Registra automáticamente las instancias nuevas en el load balancer, y recrea cualquiera que se
+  termine (por ejemplo, si falla un health check).
+- El ASG en sí **no tiene coste**: solo se paga por la EC2 (y cualquier recurso que arrastre,
+  como los volúmenes EBS), igual que si se hubiera creado a mano.
+
+### Minimum, Desired y Maximum Capacity
+
+Tres valores independientes, no hay que confundirlos:
+
+| Concepto | Qué es |
+|---|---|
+| **Minimum Capacity** | El suelo: instancias que siempre están corriendo, aunque no haya carga |
+| **Desired Capacity** | El número que el ASG mantiene *en este momento*, ajustado por las scaling policies |
+| **Maximum Capacity** | El techo: hasta dónde puede escalar el ASG si hace falta |
+
+El **Desired** siempre está entre el mínimo y el máximo. Que el máximo sea, por ejemplo, 7 no
+significa que en ese momento haya 7 instancias corriendo: significa que el ASG **puede llegar**
+hasta 7 si las scaling policies lo piden. La capacidad real en cada momento la marca el Desired.
+
+### Launch Template
+
+Es el mismo formulario que se usaría para lanzar una instancia EC2 a mano (AMI, tipo de
+instancia, security group, EBS, key pair, IAM role, user data...), pero guardado como plantilla
+reutilizable para que el ASG sepa qué lanzar cuando decide escalar.
+
+### Práctica: ASG + ALB con registro automático
+
+1. **Launch Template** con Amazon Linux 2023, t3.micro, y este user data para instalar un
+   servidor web mínimo al arrancar:
+
+   ```bash
+   #!/bin/bash
+   yum update -y
+   yum install -y httpd
+   systemctl start httpd
+   systemctl enable httpd
+   echo "<h1>Hello World from $(hostname -f)</h1>" > /var/www/html/index.html
+   ```
+
+   Nota: el comentario del script dice "Linux 2 version" pero la AMI elegida es Amazon Linux
+   2023. Funciona igual porque AL2023 usa `dnf` como gestor de paquetes pero mantiene `yum` como
+   alias por compatibilidad hacia atrás.
+
+2. **ALB + target group creados antes que el ASG**, sin ninguna instancia registrada a mano: el
+   target group se queda vacío hasta que el ASG lo pueble.
+3. Al crear el ASG:
+   - Se elige el Launch Template.
+   - Se seleccionan las subnets de las AZs a usar.
+   - En **Integrate with other services** se asocia el ASG al target group ya existente del ALB,
+     y se activa **"Turn on Elastic Load Balancing health checks"**.
+   - En **Configure group size**: Desired = 1, Min = 1, Max = 1 (todo por defecto).
+4. Al terminar de crearse, el ASG lanza automáticamente 1 instancia (porque el mínimo es 1) y la
+   registra sola en el target group del ALB, sin tocarlo a mano.
+5. Verificación: pedir la URL del ALB devuelve el "Hello World" con el hostname interno de la
+   instancia que lanzó el ASG.
+6. Se sube la capacidad a Desired = 2, Max = 2 (Min se deja en 1): el ASG lanza una segunda
+   instancia sola, en otra AZ, y aparece también healthy en el target group.
+
+### ELB health checks en el ASG
+
+Por defecto el ASG solo vigila el **EC2 status check** (si la instancia está corriendo o no).
+Activar **"Turn on Elastic Load Balancing health checks"** hace que el ASG tenga en cuenta
+también el health check del target group: si el ALB marca una instancia como *unhealthy* (por
+ejemplo, el proceso web no responde aunque la instancia siga encendida), el ASG la sustituye. Es
+la pieza que conecta la sección de ELB con la de ASG.
+
+**Health check grace period** (300 s por defecto): tiempo que el ASG espera tras lanzar una
+instancia antes de empezar a evaluar sus health checks, para no matarla mientras el user data
+todavía se está ejecutando.
+
+### Orden de borrado (con ASG de por medio)
+
+1. **ASG** primero — al borrarlo termina también las instancias que gestiona.
+2. **ALB**.
+3. **Target group** (borrado asíncrono, tarda en liberarse).
+4. **Security group**.
+
+---
+
 ## Resumen para el examen
 
 | Concepto | Clave |
@@ -1118,3 +1204,10 @@ momento no se relacionara con este concepto.
 | Duración del Flow Hash | La conexión TCP/UDP entera va **al mismo destino** |
 | Condiciones de regla del ALB | `host-header`, `http-request-method`, `path-pattern`, `source-ip`, `http-header`, `query-string` |
 | Target Group Weighting | **Una regla, varios target groups con pesos**. Blue/green sin tocar DNS |
+| Coste del ASG | El ASG es **gratis**. Se paga solo la EC2 (y lo que arrastre: EBS, etc.) |
+| Min / Desired / Max Capacity | Desired siempre entre min y max. Max = techo posible, no capacidad actual |
+| Launch Template | Mismo formulario que lanzar una EC2 a mano, guardado como plantilla reutilizable |
+| ASG + ALB | El target group se crea vacío; el ASG registra las instancias solo, sin tocarlo a mano |
+| ELB health checks en el ASG | Por defecto el ASG solo mira el status check de EC2. Activarlo hace que también sustituya instancias que fallan el health check del target group |
+| Health check grace period | 300 s por defecto. Evita matar una instancia mientras el user data aún se ejecuta |
+| Orden de borrado con ASG | ASG (mata las instancias) → ALB → target group → security group |

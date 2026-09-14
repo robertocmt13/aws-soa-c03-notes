@@ -641,11 +641,27 @@ Funciona en **CLB, ALB y NLB**, pero cada uno lo resuelve de forma distinta.
 
 El balanceador inserta una cookie que el navegador devuelve en cada petición siguiente.
 
-| Tipo de cookie | Quién la genera | Nombre | Duración |
-|---|---|---|---|
-| Duration-based | El load balancer | `AWSALB` (ALB) / `AWSELB` (CLB) | **7 días fijos, no configurable** |
-| Application cookie | El target (tu app) | Lo eliges tú (no puede ser `AWSALB`, `AWSALBAPP` ni `AWSALBTG`, reservados) | La decide tu app |
-| Application-based (auto) | El load balancer, imitando a una cookie de tu app | `AWSALBAPP` | — |
+| Tipo de cookie | Quién la genera | Nombre |
+|---|---|---|
+| Duration-based | El load balancer | `AWSALB` (ALB) / `AWSELB` (CLB) |
+| Application cookie (custom) | El target (tu app) | Lo eliges tú (no puede empezar por `AWSALB`, `AWSALBAPP` ni `AWSALBTG`, reservados) |
+| Application-based (auto) | El load balancer, imitando a una cookie de tu app | `AWSALBAPP` |
+
+### Duración: dos cosas distintas que es fácil confundir
+
+Hay **dos temporizadores** y no son el mismo:
+
+| | Qué es | Valor |
+|---|---|---|
+| **Duración de la stickiness** (`stickiness.lb_cookie.duration_seconds`) | Cuánto tiempo el ALB sigue mandando a ese cliente al mismo destino. Es lo que se configura en el target group | **Configurable: de 1 segundo a 7 días. Por defecto 1 día (86400 s)** |
+| **Caducidad de la propia cookie `AWSALB`** (atributo `Expires`) | Cuándo el navegador tira la cookie | **7 días, no configurable** |
+
+El "7 días fijos" que se oye a menudo se refiere solo al segundo. Lo que decide el comportamiento
+del balanceador, y lo que se toca en la consola (*Stickiness duration*), es el primero, y **sí es
+configurable**. El ALB además **reinicia el contador en cada petición**.
+
+La cookie de aplicación tiene su propio `stickiness.app_cookie.duration_seconds`, también de 1 s
+a 7 días con 1 día por defecto.
 
 Con stickiness activo en la práctica del ALB, el navegador manda siempre la misma cookie y el
 ALB la respeta: se vería la misma instancia en cada recarga, en vez de alternar como en la
@@ -810,8 +826,8 @@ Cómo funciona:
 
 - Deja de mandar **peticiones nuevas** al destino que se está dando de baja.
 - Espera a que las conexiones ya abiertas terminen su trabajo.
-- Rango: **de 1 a 3600 segundos**, con **300 segundos por defecto**.
-- Se puede **desactivar poniéndolo a 0**.
+- Rango: **de 0 a 3600 segundos**, con **300 segundos por defecto**.
+- El 0 está dentro del rango y es precisamente lo que **desactiva** la funcionalidad.
 - Conviene un valor **bajo** si las peticiones son cortas.
 
 No es que el balanceador reparta nada distinto: lo que hace es **proteger las peticiones ya en
@@ -830,21 +846,25 @@ en seco a mitad de petición.
 | **Initial** | Se está registrando el destino |
 | **Healthy** | Pasa los chequeos |
 | **Unhealthy** | Falla los chequeos |
-| **Unused** | El destino no está registrado |
+| **Unused** | El destino **no recibe tráfico** por alguno de estos motivos: no está registrado, su target group no se usa en ninguna regla de listener, está en una AZ no habilitada en el balanceador, o está **parado o terminado** |
 | **Draining** | Se está dando de baja el destino |
 | **Unavailable** | Los health checks están desactivados |
 
 ### Parámetros
 
-| Ajuste | Valor por defecto | Qué hace |
-|---|---|---|
-| `HealthCheckProtocol` | HTTP | Protocolo del chequeo (HTTP o HTTPS) |
-| `HealthCheckPort` | 80 | Puerto del chequeo |
-| `HealthCheckPath` | `/` | **Ruta de destino, configurable** |
-| `HealthCheckTimeoutSeconds` | 5 | Se da por fallado si no responde en ese tiempo |
-| `HealthCheckIntervalSeconds` | 30 | Cada cuánto se lanza el chequeo |
-| `HealthyThresholdCount` | 3 | Chequeos correctos seguidos para marcarlo *healthy* |
-| `UnhealthyThresholdCount` | 5 | Chequeos fallidos seguidos para marcarlo *unhealthy* |
+| Ajuste | Valor por defecto (ALB) | Rango | Qué hace |
+|---|---|---|---|
+| `HealthCheckProtocol` | HTTP | HTTP o HTTPS | Protocolo del chequeo |
+| `HealthCheckPort` | **`traffic-port`** | — | El mismo puerto por el que el destino recibe tráfico del balanceador. **No es un 80 fijo** |
+| `HealthCheckPath` | `/` | — | **Ruta de destino, configurable** |
+| `HealthCheckTimeoutSeconds` | 5 | 2–120 s | Se da por fallado si no responde en ese tiempo |
+| `HealthCheckIntervalSeconds` | 30 | 5–300 s | Cada cuánto se lanza el chequeo |
+| `HealthyThresholdCount` | **5** | 2–10 | Chequeos correctos seguidos para marcarlo *healthy* |
+| `UnhealthyThresholdCount` | **2** | 2–10 | Chequeos fallidos seguidos para marcarlo *unhealthy* |
+
+> El umbral de *unhealthy* es **más bajo** que el de *healthy* (2 frente a 5): AWS retira un
+> destino en cuanto falla un par de veces, pero le exige más aciertos seguidos antes de volver a
+> mandarle tráfico. Prudente en las dos direcciones.
 
 El **intervalo tiene que ser mayor o igual que el timeout**: si no, se lanzaría el chequeo
 siguiente antes de que terminase el anterior.
@@ -862,7 +882,9 @@ La ruta del health check **no tiene que ser la raíz**. Se puede apuntar a un en
 ### Cuando todos los destinos están unhealthy
 
 Si un target group **solo contiene destinos unhealthy**, el ELB enruta las peticiones **entre
-esos destinos unhealthy** de todos modos.
+esos destinos unhealthy** de todos modos. AWS lo llama **fail open**: cuando todos los destinos
+fallan a la vez en todas las AZs habilitadas, el balanceador abre el paso a todos ellos en lugar
+de cerrarlo.
 
 La diapositiva lo llama explícitamente un escenario de **best effort**: el balanceador no
 garantiza que la petición vaya a funcionar, simplemente prefiere intentarlo con algo antes que
@@ -1090,15 +1112,30 @@ reutilizable para que el ASG sepa qué lanzar cuando decide escalar.
 
 ### ELB health checks en el ASG
 
-Por defecto el ASG solo vigila el **EC2 status check** (si la instancia está corriendo o no).
-Activar **"Turn on Elastic Load Balancing health checks"** hace que el ASG tenga en cuenta
-también el health check del target group: si el ALB marca una instancia como *unhealthy* (por
-ejemplo, el proceso web no responde aunque la instancia siga encendida), el ASG la sustituye. Es
-la pieza que conecta la sección de ELB con la de ASG.
+Por defecto el ASG **ignora los health checks del balanceador**. Lo que mira siempre, y no se
+puede desactivar, son los **EC2 status checks**, que cubren dos cosas:
 
-**Health check grace period** (300 s por defecto): tiempo que el ASG espera tras lanzar una
-instancia antes de empezar a evaluar sus health checks, para no matarla mientras el user data
-todavía se está ejecutando.
+- El **estado de la instancia**: cualquier estado distinto de `running` (`stopping`, `stopped`,
+  `shutting-down`, `terminated`) se trata como fallo **inmediato**.
+- Los **status checks de sistema e instancia**: si quedan `impaired`, el ASG **espera unos
+  minutos** por si AWS lo arregla solo antes de marcarla *unhealthy*. Un `insufficient-data`
+  tampoco cuenta como fallo.
+
+Activar **"Turn on Elastic Load Balancing health checks"** añade el health check del target
+group: si el ALB marca una instancia como *unhealthy* (el proceso web no responde aunque la
+instancia siga encendida), el ASG la sustituye. Es la pieza que conecta la sección de ELB con la
+de ASG, y sin ella una instancia con httpd caído seguiría viva indefinidamente porque para EC2
+está perfectamente sana.
+
+**Health check grace period**: tiempo que el ASG espera, desde que la instancia entra en
+`InService`, antes de evaluar sus health checks. Evita matarla mientras el user data todavía se
+está ejecutando.
+
+- **300 s por defecto en la consola**, pero **0 s por CLI o SDK**. Un ASG creado por
+  CloudFormation o Terraform sin especificarlo no tiene margen ninguno.
+- El grace period **no protege de todo**: si la instancia pasa a un estado distinto de `running`
+  (por ejemplo alguien la para), el ASG la marca *unhealthy* y la reemplaza **aunque el grace
+  period siga corriendo**. Lo dice el propio formulario de la consola.
 
 ### Orden de borrado (con ASG de por medio)
 
@@ -1165,7 +1202,7 @@ todavía se está ejecutando.
 | GWLB, protocolo hacia el appliance | GENEVE, puerto 6081 |
 | Appliances del GWLB | Productos de terceros ya compatibles con GENEVE, no `iptables` casero |
 | Sticky sessions, dónde funciona | CLB, ALB y NLB |
-| Cookie `AWSALB`/`AWSELB` (duration-based) | 7 días fijos, no configurable |
+| Duración de la stickiness | **Configurable: 1 s a 7 días, por defecto 1 día**. Los "7 días fijos" son la caducidad de la cookie `AWSALB`, no la duración de la stickiness |
 | Cookie reservada, no usar | `AWSALB`, `AWSALBAPP`, `AWSALBTG` |
 | Sticky sessions en NLB | Por IP de origen (hash), no por cookie |
 | Stickiness incompatible con | Cross-zone apagado, y con el algoritmo Weighted random |
@@ -1182,13 +1219,13 @@ todavía se está ejecutando.
 | Coste de ACM | Certificados públicos **gratis**. Lo que se paga es **ACM Private CA** |
 | Práctica de SSL | No se completa: sin dominio propio validado no hay certificado en ACM |
 | Connection Draining vs Deregistration Delay | Mismo concepto: CLB vs **ALB y NLB** |
-| Deregistration Delay | **1 a 3600 s, por defecto 300**. Se desactiva con 0. Bajo si las peticiones son cortas |
+| Deregistration Delay | **0 a 3600 s, por defecto 300**. El 0 lo desactiva. Bajo si las peticiones son cortas |
 | Qué protege el draining | Las peticiones **ya en curso** cuando un destino se da de baja o falla |
 | Estados del destino | Initial, Healthy, Unhealthy, Unused, Draining, **Unavailable** (checks desactivados) |
-| Health check, valores por defecto | Intervalo 30 s, timeout 5 s, healthy 3, unhealthy 5, path `/` |
+| Health check, valores por defecto (ALB) | Intervalo 30 s, timeout 5 s, **healthy 5, unhealthy 2**, path `/`, puerto `traffic-port` |
 | Intervalo y timeout | El **intervalo ≥ timeout**, o se solaparían los chequeos |
 | Ruta del health check | **Configurable**. Mejor un endpoint dedicado y ligero que la raíz |
-| Target group todo unhealthy | El ELB enruta **entre los unhealthy** de todos modos. Escenario **best effort** |
+| Target group todo unhealthy | El ELB enruta **entre los unhealthy** de todos modos: **fail open**, escenario best effort |
 | HTTP 400 | Petición malformada del cliente |
 | HTTP 503 | **Sin destinos sanos** en alguna AZ configurada. Mirar `HealthyHostCount` |
 | HTTP 504 | Timeout. El **keep-alive** de la instancia debe superar el *idle timeout* del balanceador |
@@ -1208,6 +1245,6 @@ todavía se está ejecutando.
 | Min / Desired / Max Capacity | Desired siempre entre min y max. Max = techo posible, no capacidad actual |
 | Launch Template | Mismo formulario que lanzar una EC2 a mano, guardado como plantilla reutilizable |
 | ASG + ALB | El target group se crea vacío; el ASG registra las instancias solo, sin tocarlo a mano |
-| ELB health checks en el ASG | Por defecto el ASG solo mira el status check de EC2. Activarlo hace que también sustituya instancias que fallan el health check del target group |
-| Health check grace period | 300 s por defecto. Evita matar una instancia mientras el user data aún se ejecuta |
+| ELB health checks en el ASG | Por defecto el ASG **ignora** los del balanceador: solo mira los EC2 status checks (estado ≠ `running` = fallo inmediato). Activarlo permite sustituir instancias vivas cuyo servicio no responde |
+| Health check grace period | **300 s en consola, 0 s por CLI/SDK**. No impide reemplazar una instancia que pase a estado ≠ `running` |
 | Orden de borrado con ASG | ASG (mata las instancias) → ALB → target group → security group |

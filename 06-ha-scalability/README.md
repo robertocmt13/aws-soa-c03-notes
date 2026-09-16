@@ -2,11 +2,14 @@
 
 Notas de la Sección 6 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 50 a 69 completadas: escalabilidad, alta disponibilidad,
+> **Sección completada.** Lecciones 50 a 78, con el cuestionario final resuelto (16/16):
+> escalabilidad, alta disponibilidad,
 > Elastic Load Balancing, Application Load Balancer y Network Load Balancer (teoría y práctica),
 > Gateway Load Balancer, Sticky Sessions, Cross-Zone Load Balancing, certificados SSL y SNI,
 > Deregistration Delay, health checks, monitorización y troubleshooting, atributos del target
-> group y reglas del ALB, Auto Scaling Groups (teoría y práctica completa con ALB).
+> group y reglas del ALB, Auto Scaling Groups (teoría y práctica completa con ALB), scaling
+> policies con práctica de target tracking, Instance Refresh, Warm Pools, lifecycle hooks,
+> SQS con ASG, troubleshooting, CloudWatch para ASG y el servicio AWS Auto Scaling.
 
 ---
 
@@ -1146,6 +1149,346 @@ está ejecutando.
 
 ---
 
+## Scaling Policies
+
+Tres familias, que se corresponden con las tres secciones de la pestaña **Automatic scaling**
+del ASG en consola.
+
+### Dynamic Scaling (reactivo)
+
+Reacciona a lo que está pasando ahora mismo.
+
+| Tipo | Cómo funciona |
+|---|---|
+| **Target Tracking** | Le das una métrica y un valor objetivo ("quiero la CPU media del ASG en torno al 40%") y el ASG se encarga del resto. Es el más simple de montar |
+| **Simple / Step Scaling** | Se ata a una alarma de CloudWatch concreta y define el salto: "si CPU > 70%, añade 2 instancias"; "si CPU < 30%, quita 1" |
+
+### Scheduled Scaling (programado por ti)
+
+Se anticipa a patrones **que tú ya conoces**: fija min/max/desired para una fecha y hora, con
+repetición opcional. Ejemplo del curso: subir la capacidad mínima a 10 los viernes a las 17:00.
+Ejemplo propio: la semana del Black Friday.
+
+### Predictive Scaling (previsión automática)
+
+**AWS analiza el histórico y programa el escalado solo, sin que tú definas ninguna hora.**
+
+Ciclo: analiza la carga histórica → genera un forecast → programa acciones de escalado con
+antelación.
+
+- Usa **machine learning** sobre las métricas de CloudWatch del propio ASG.
+- Necesita **un mínimo de 24 h de histórico** para el primer forecast; con **14 días** las
+  predicciones son bastante más precisas.
+- Detecta patrones recurrentes (diarios o semanales) por su cuenta.
+
+> **No confundir con Scheduled Scaling.** En scheduled **tú** dices la hora porque sabes lo que
+> va a pasar (Black Friday). En predictive **AWS** detecta el patrón solo a partir del histórico
+> y decide cuándo escalar. Si un servidor lanza crons pesados todas las noches a las 4:00,
+> predictive scaling acabaría adelantando capacidad a esa hora sin que nadie lo programe.
+
+### Buenas métricas para escalar
+
+| Métrica | Cuándo usarla |
+|---|---|
+| `CPUUtilization` | Media de CPU de las instancias. La opción por defecto y la más habitual |
+| `RequestCountPerTarget` | **Media de peticiones que recibe cada instancia**. Si sube del target, cada una está más cargada de la cuenta → scale out; si baja, sobran instancias → scale in. Útil cuando la CPU no refleja la carga real (apps que esperan a I/O o a base de datos: CPU baja pero saturadas de conexiones) |
+| `Average Network In / Out` | Si la aplicación está limitada por red |
+| Métrica personalizada | Cualquiera que se publique en CloudWatch desde la propia aplicación |
+
+### Scaling Cooldowns
+
+Tras cada actividad de escalado, el ASG entra en un **periodo de cooldown (300 s por defecto)**
+durante el cual **no lanza ni termina instancias**, para dar tiempo a que las métricas se
+estabilicen y no encadenar decisiones sobre datos que aún no reflejan el cambio anterior.
+
+El diagrama del curso lo resume: ocurre una acción de escalado → ¿hay cooldown activo? → si sí,
+**se ignora la acción**; si no, se lanza o se termina la instancia.
+
+> **Consejo del curso**: usar una **AMI ya preparada** (*ready-to-use*) reduce el tiempo de
+> configuración de cada instancia, así empiezan a servir peticiones antes y se puede acortar el
+> cooldown. Mismo principio que tener una imagen provisionada en vez de instalar paquetes en
+> cada arranque.
+
+---
+
+## Práctica: Target Tracking con scale-out real
+
+Montaje: se recrean ASG + ALB igual que en la práctica de la 69, y sobre el ASG se crea una
+**dynamic scaling policy** de tipo **Target tracking**:
+
+| Campo | Valor |
+|---|---|
+| Policy type | Target tracking scaling |
+| Metric type | Average CPU utilization |
+| Target value | 40 |
+| Instance warmup | 300 s |
+
+Para provocar el escalado se instala `stress` en la instancia y se satura la CPU. La CPU llega
+al **93,91%** en la gráfica de CloudWatch del ASG y el escalado se dispara solo.
+
+En **Activity history** queda el rastro exacto de lo ocurrido:
+
+```
+a monitor alarm TargetTracking-DemoASG-AlarmHigh-… in state ALARM
+triggered policy Target Tracking Policy changing the desired capacity from 1 to 2
+```
+
+y la instancia nueva aparece en estado *Waiting for instance warm up*.
+
+### Las alarmas las crea AWS, no tú
+
+Al crear una política de **target tracking**, CloudWatch recibe **dos alarmas creadas
+automáticamente**: una `AlarmHigh` que dispara el scale-out y otra `AlarmLow` que dispara el
+scale-in. Tú solo indicas el target value. De ahí el nombre `TargetTracking-DemoASG-AlarmHigh-…`
+que aparece en el historial, en lugar de un nombre propio.
+
+Consecuencia al limpiar: **borrar el ASG borra esas alarmas solo**. Con políticas **simple o
+step scaling** no ocurre lo mismo — ahí hay que ir a CloudWatch y borrar la alarma a mano,
+porque borrar la política solo quita la acción asociada.
+
+### Detalles del formulario que el vídeo no explica
+
+- **Instance warmup** no es lo mismo que el *health check grace period*. Durante el warmup, las
+  métricas de la instancia nueva **no cuentan** para la media del grupo, para que una máquina que
+  aún está arrancando no falsee el cálculo del target tracking.
+- **Disable scale in to create only a scale-out policy**: la política solo añade instancias,
+  nunca las quita. Sirve para dejar el scale-in en manos de otra política o para evitar
+  oscilaciones continuas.
+- En **Predictive scaling**: el toggle **Scale based on forecast** se puede apagar para dejar la
+  política en modo *forecast-only* (predice pero no actúa), útil para validar la calidad de las
+  predicciones antes de fiarse. Solo **una** política predictiva puede tener el scaling activo a
+  la vez. **Pre-launch instances** (0–60 min) adelanta el lanzamiento respecto a la hora prevista
+  del pico.
+
+### Limpieza
+
+ASG → ALB → target group → security group. No hay que tocar CloudWatch: las alarmas de target
+tracking se van con el ASG.
+
+---
+
+## Instance Refresh
+
+Sustituye **todas** las instancias del ASG para aplicar un Launch Template actualizado (por
+ejemplo, con una AMI nueva), sin montar nada por fuera.
+
+- Se actualiza el launch template y se lanza `StartInstanceRefresh`.
+- **Minimum healthy percentage**: qué porcentaje de la capacidad deseada debe seguir sano
+  durante el proceso. El ejemplo del curso usa 60%, pero el **valor por defecto real de AWS es
+  90%**.
+  - Cuanto **más bajo**, más instancias se reemplazan a la vez → más rápido, menos margen.
+  - Con **100%**, AWS lanza las nuevas **antes** de terminar las viejas, así la capacidad
+    deseada nunca baja.
+- **Warm-up time** (tiempo de calentamiento): cuánto espera antes de dar por buena una instancia
+  y pasar a la siguiente. Si no se especifica, reutiliza el `Default instance warmup` del ASG —
+  el mismo ajuste que aparece en las scaling policies.
+
+Es el equivalente gestionado a ir sustituyendo servidores uno a uno a mano en un panel, pero sin
+corte visible para el usuario.
+
+---
+
+## Warm Pools
+
+### El problema: scale-out latency
+
+Cuando el ASG escala, intenta lanzar instancias lo más rápido posible, pero algunas aplicaciones
+arrastran una latencia inevitable en el arranque (varios minutos o más): aplicar actualizaciones,
+hidratar datos o estado, ejecutar scripts de configuración… cosas que solo pueden pasar en el
+primer boot.
+
+Antes solo había dos parches, ninguno bueno: **sobre-aprovisionar** (pagar de más por si acaso) o
+usar **golden images** para acortar el arranque. Warm Pools ataca el problema de raíz.
+
+### La solución
+
+Un conjunto de instancias **ya inicializadas** que espera al lado del ASG. En un evento de
+scale-out, el ASG **coge una del warm pool** en lugar de lanzar una desde cero.
+
+**Tamaño del warm pool:**
+- *Minimum warm pool size*: las que siempre hay en la piscina.
+- *Max prepared capacity* = capacidad máxima del ASG (por defecto), o un número fijo.
+
+**Estado en el que se mantienen** (`Warm Pool Instance State`):
+
+| Estado | Qué pasa | Coste |
+|---|---|---|
+| **Stopped** (por defecto) | Apagada; la inicialización ya hecha queda guardada en el volumen EBS | Solo el EBS. Es la opción recomendada para minimizar coste |
+| **Running** | Encendida pero sin servir tráfico | Se paga la **instancia entera** aunque no haga nada. AWS lo desaconseja salvo que se necesite la latencia más baja posible |
+| **Hibernated** | Apagada conservando el contenido de la RAM volcado a EBS | Como Stopped, pero arranca más rápido al no tener que reconstruir la memoria |
+
+> Pregunta típica de examen: ¿minimizar coste? **Stopped**. ¿Minimizar latencia? **Running**.
+
+**Detalle importante**: las instancias del warm pool **no cuentan para las métricas del ASG que
+afectan a las Scaling Policies**. Una instancia parada en la piscina no altera la CPU media del
+grupo ni dispara ninguna política.
+
+---
+
+## Lifecycle Hooks
+
+Por defecto, una instancia entra **en servicio en cuanto se lanza**. Los lifecycle hooks
+permiten meter pasos intermedios antes de eso, o antes de terminarla.
+
+| Transición | Estado | Para qué |
+|---|---|---|
+| `EC2_Instance_Launching` | `Pending:Wait` → `Pending:Proceed` | Ejecutar un script en la instancia mientras arranca, antes de ponerla en servicio |
+| `EC2_Instance_Terminating` | `Terminating:Wait` → `Terminating:Proceed` | Pausar la instancia antes de matarla, para diagnosticar |
+
+**Casos de uso** (los da la propia diapositiva): limpieza, extracción de logs, health checks
+especiales.
+
+**Integración**: los eventos de ciclo de vida se pueden enviar a **EventBridge** (que a su vez
+puede invocar una **Lambda**), a **SNS** o a **SQS**.
+
+**Tiempos y resultado por defecto:**
+- La instancia se queda en el estado `Wait` durante el **heartbeat timeout: 3600 s (1 hora) por
+  defecto**, rango 30–7200 s. Se puede alargar llamando a `record-lifecycle-action-heartbeat`, o
+  cortar antes con `complete-lifecycle-action`.
+- Si expira sin confirmación, se aplica el **Default Result, que por defecto es `ABANDON`**: en
+  un lanzamiento, la instancia se da por fallida y se termina; en una terminación, se termina
+  igual (la diferencia entre `ABANDON` y `CONTINUE` ahí es solo si se ejecutan o no los demás
+  hooks pendientes).
+
+---
+
+## Launch Configuration frente a Launch Template
+
+| | Launch Configuration (legacy) | Launch Template |
+|---|---|---|
+| Contenido | AMI, tipo de instancia, key pair, security groups, tags, user data… | Lo mismo |
+| Editable | **No** | **No** (pero admite versiones nuevas) |
+| Versiones | — | **Varias versiones** y subconjuntos de parámetros reutilizables/heredables |
+| Spot | — | On-Demand, Spot **o mezcla** |
+| Extras | — | Placement Groups, Capacity Reservations, Dedicated Hosts, varios tipos de instancia, T2 unlimited |
+| Estado | Deprecated | **Recomendado por AWS** |
+
+**Ninguno de los dos se puede editar** una vez creado: la diferencia es que el Launch Template
+permite crear **versiones nuevas**, mientras que una Launch Configuration hay que recrearla
+entera cada vez.
+
+En la práctica ya ni aparece la opción: desde el **1 de octubre de 2024** las cuentas nuevas no
+pueden crear Launch Configurations, ni por consola ni por CLI/API. Para una cuenta creada
+recientemente, Launch Template es la única vía.
+
+---
+
+## SQS con un Auto Scaling Group
+
+**SQS (Simple Queue Service)** es una cola de mensajes gestionada: un productor mete mensajes en
+la cola y uno o varios consumidores los van sacando y procesando. El mensaje solo desaparece
+cuando el consumidor confirma que lo ha procesado.
+
+En este patrón, las instancias del ASG son los **consumidores**: hacen *poll* a la cola para
+coger trabajo.
+
+```
+SQS Queue → (poll) → EC2 Instances (ASG)
+   ↓
+CloudWatch Metric: ApproximateNumberOfMessages
+   ↓ (alarm for breach)
+CloudWatch Alarm → scale → ASG
+```
+
+La métrica clave es **`ApproximateNumberOfMessages`**: cuántos mensajes hay esperando sin
+procesar. Si la cola crece porque llegan más trabajos de los que las instancias pueden digerir,
+una alarma dispara el scale-out; si se vacía, scale-in.
+
+> Es un criterio de escalado **distinto** a CPU o `RequestCountPerTarget`: allí se escala por
+> tráfico HTTP en tiempo real, aquí por **backlog de trabajo pendiente**. Encaja con procesos
+> asíncronos (generar PDFs, redimensionar imágenes, enviar correos en cola) en lugar de servir
+> peticiones web directas.
+
+---
+
+## Troubleshooting de ASG
+
+| Mensaje | Causa | Solución |
+|---|---|---|
+| `<n> instance(s) are already running. Launching EC2 instance failed.` | Se alcanzó el límite de `MaximumCapacity` | Subir la capacidad máxima del ASG |
+| `Launching EC2 instances is failing` — *The security group does not exist* | El SG referenciado por el launch template fue borrado | Recrearlo o apuntar a otro |
+| `Launching EC2 instances is failing` — *The key pair does not exist* | El key pair fue borrado | Igual |
+
+**Suspensión administrativa**: si el ASG **falla al lanzar una instancia durante más de 24
+horas**, suspende automáticamente los procesos. Práctico de recordar: un ASG que "no hace nada"
+pese a estar por debajo del mínimo puede tener el proceso `Launch` suspendido; hay que arreglar
+la causa y reactivarlo con *Resume processes*.
+
+---
+
+## CloudWatch para ASG
+
+Las métricas se recogen **cada 1 minuto**.
+
+### Métricas a nivel de ASG (hay que activarlas)
+
+`GroupMinSize`, `GroupMaxSize`, `GroupDesiredCapacity`, `GroupInServiceInstances`,
+`GroupPendingInstances`, `GroupStandbyInstances`, `GroupTerminatingInstances`,
+`GroupTotalInstances`.
+
+Son **opt-in**: hay que habilitar la recolección de métricas (en la consola, un check en la
+pestaña **Monitoring** del ASG).
+
+### Métricas a nivel de EC2 (ya activas)
+
+`CPUUtilization` y compañía, con dos granularidades:
+
+| Monitorización | Granularidad |
+|---|---|
+| Basic | 5 minutos |
+| Detailed | 1 minuto |
+
+> **Ojo con mezclar los dos "1 minuto".** Las métricas de **grupo** son gratis aunque tengan
+> granularidad de 1 minuto y **no requieren activar detailed monitoring**. Lo que cuesta dinero
+> es el **detailed monitoring a nivel de instancia EC2**. Son cosas distintas que comparten
+> cifra.
+
+---
+
+## AWS Auto Scaling (el servicio, no el ASG)
+
+**No es lo mismo que EC2 Auto Scaling.** El ASG escala solo instancias EC2; **AWS Auto Scaling**
+es un servicio paraguas para gestionar el escalado de **varios servicios desde un único sitio**:
+
+| Recurso | Qué escala |
+|---|---|
+| **EC2 Auto Scaling groups** | Lanza o termina instancias EC2 |
+| **EC2 Spot Fleet requests** | Lanza/termina instancias de un Spot Fleet, o reemplaza las interrumpidas por precio o capacidad |
+| **Amazon ECS** | Sube o baja el *desired count* del servicio |
+| **DynamoDB** (tabla o índice secundario global) | WCU y RCU |
+| **Amazon Aurora** | Read replicas dinámicas |
+
+> Si la pregunta es "¿qué servicio permite escalar EC2, ECS y DynamoDB desde un mismo lugar?",
+> la respuesta es **AWS Auto Scaling**, no EC2 Auto Scaling.
+
+### Scaling Plans
+
+Un scaling plan agrupa recursos y les aplica una **estrategia**. La diferencia con montar el
+target tracking a mano en el ASG: aquí **no se elige la métrica ni el valor uno a uno**, se elige
+una estrategia y AWS crea las políticas de target tracking por ti para todos los recursos del
+plan.
+
+| Estrategia | Utilización objetivo |
+|---|---|
+| Optimize for availability | **40%** |
+| Balance availability and cost | **50%** |
+| Optimize for cost | **70%** |
+| Custom | Métrica y target propios |
+
+Opciones adicionales: desactivar scale-in, cooldown period y warmup time (para ASG).
+
+También ofrece **predictive scaling** con el mismo ciclo ya visto (analizar histórico → generar
+forecast → programar acciones).
+
+### Práctica
+
+El asistente (*Create scaling plan*) permite encontrar recursos de tres formas: por **stack de
+CloudFormation**, por **tags**, o **eligiendo Auto Scaling groups** directamente. Se recorren los
+cuatro pasos (find resources → scaling strategy → advanced settings → review) pero **el curso no
+llega a crear el plan**, así que no queda nada desplegado.
+
+---
+
 ## Resumen para el examen
 
 | Concepto | Clave |
@@ -1248,3 +1591,23 @@ está ejecutando.
 | ELB health checks en el ASG | Por defecto el ASG **ignora** los del balanceador: solo mira los EC2 status checks (estado ≠ `running` = fallo inmediato). Activarlo permite sustituir instancias vivas cuyo servicio no responde |
 | Health check grace period | **300 s en consola, 0 s por CLI/SDK**. No impide reemplazar una instancia que pase a estado ≠ `running` |
 | Orden de borrado con ASG | ASG (mata las instancias) → ALB → target group → security group |
+| Target Tracking | Le das métrica + valor objetivo. El más simple de configurar |
+| Simple / Step Scaling | Atado a una alarma de CloudWatch concreta: "si CPU > 70%, +2 instancias" |
+| Scheduled Scaling | **Tú** fijas la hora porque conoces el patrón (viernes 17:00, Black Friday) |
+| Predictive Scaling | **AWS** detecta el patrón solo con ML. Mínimo 24 h de histórico, ideal 14 días |
+| `RequestCountPerTarget` | Media de peticiones **por instancia**. Útil cuando la CPU no refleja la carga real |
+| Scaling Cooldown | **300 s por defecto**. Durante el cooldown el ASG ignora nuevas acciones de escalado |
+| Alarmas del target tracking | Las crea AWS solas (`AlarmHigh`/`AlarmLow`) y **se borran con el ASG**. Con simple/step hay que borrarlas a mano |
+| Instance warmup en scaling policies | Las métricas de la instancia nueva **no cuentan** para la media mientras calienta |
+| Instance Refresh | Sustituye todas las instancias con el launch template nuevo. Min healthy percentage **90% por defecto**; con 100% lanza antes de terminar |
+| Warm Pools | Instancias **pre-inicializadas** esperando. Resuelve la *scale-out latency* |
+| Warm Pool: estado | **Stopped** (por defecto, más barato) / **Running** (más rápido, se paga entera) / **Hibernated** (conserva la RAM) |
+| Warm Pools y métricas | **No cuentan** para las métricas que afectan a las Scaling Policies |
+| Lifecycle Hooks | `Pending:Wait` y `Terminating:Wait`. Heartbeat timeout **3600 s**, default result **ABANDON** |
+| Launch Template vs Configuration | Ninguno es editable; el Template admite **versiones**. Las cuentas nuevas ya no pueden crear Launch Configurations |
+| SQS + ASG | Se escala por `ApproximateNumberOfMessages`: **backlog de trabajo**, no tráfico HTTP |
+| ASG falla 24 h al lanzar | **Suspensión administrativa** de los procesos. Revisar si `Launch` está suspendido |
+| Métricas de grupo del ASG | **Opt-in, gratis, 1 minuto**, sin necesidad de detailed monitoring |
+| Detailed monitoring EC2 | 1 minuto **con coste**. Basic = 5 minutos |
+| AWS Auto Scaling (servicio) | Escala EC2 ASG, Spot Fleet, ECS, DynamoDB y Aurora **desde un solo sitio** |
+| Scaling Plans: estrategias | Availability **40%**, Balance **50%**, Cost **70%**, o custom |

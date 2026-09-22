@@ -21,7 +21,7 @@ qué no, y cómo se relaciona con lo que ya venía haciendo en producción.
 | [04 - AMI](./04-ami/) | AMI, no reboot, migración entre regiones y AZs, cross-account sharing y copy, EC2 Image Builder, AMI in production |
 | [05 - Systems Manager](./05-ssm/) | SSM Agent y requisitos, tags y resource groups, documents y Run Command, Automation, Parameter Store, Fleet Manager, DHMC, Inventory, State Manager, Patch Manager, Maintenance Windows, Session Manager, Distributor y OpsCenter |
 | [06 - HA y escalabilidad](./06-ha-scalability/) | Escalado vertical y horizontal, alta disponibilidad frente a DR, Elastic Load Balancing, tipos de load balancer, ALB: target groups, reglas de enrutamiento, cadena de security groups y práctica completa, NLB: IP fija por AZ, target groups, NLB delante de ALB y práctica, GWLB, Sticky Sessions, Cross-Zone Load Balancing, certificados SSL y SNI, Deregistration Delay, health checks, monitorización y troubleshooting, atributos del target group y reglas del ALB, Auto Scaling Groups con integración ALB, scaling policies y práctica de target tracking, Instance Refresh, Warm Pools, lifecycle hooks, SQS con ASG, CloudWatch para ASG y AWS Auto Scaling |
-| [07 - CloudFormation](./07-cloudformation/) | Infraestructura como código, ventajas, funcionamiento con S3 y stacks, despliegue manual y automatizado, componentes de una plantilla *(en curso)* |
+| [07 - CloudFormation](./07-cloudformation/) | Infraestructura como código, ventajas, funcionamiento con S3 y stacks, despliegue manual y automatizado, componentes de una plantilla, prácticas de Create, Update y Delete Stack con parámetros, tags y change sets *(en curso)* |
 
 ## Contexto
 

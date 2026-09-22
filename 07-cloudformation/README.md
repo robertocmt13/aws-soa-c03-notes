@@ -2,8 +2,9 @@
 
 Notas de la Sección 7 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lección 79 completada: qué es CloudFormation, ventajas, funcionamiento,
-> formas de desplegar plantillas y componentes de una plantilla.
+> Sección en curso. Lecciones 79 a 81 completadas: qué es CloudFormation, ventajas,
+> funcionamiento, formas de desplegar plantillas, componentes de una plantilla y prácticas de
+> Create, Update y Delete Stack.
 
 ---
 
@@ -79,6 +80,64 @@ Template ──upload──> S3 bucket <──reference── CloudFormation ─
 
 ---
 
+## Práctica: Create Stack (lección 80)
+
+Plantilla mínima: una instancia EC2. Crear el stack desde la consola, opción **Choose an
+existing template → Amazon S3 URL**.
+
+- **La opción "Use a sample template" ha desaparecido.** El curso la usaba para cargar una
+  plantilla de ejemplo (WordPress Multi-AZ) sin tener que subir nada. Ahora hay que coger esa
+  misma plantilla como una **Amazon S3 URL** manual (la URL viene en el material del curso) y
+  pegarla en **Choose an existing template → Amazon S3 URL**. Desde ahí, el botón **View in
+  Infrastructure Composer** abre el diagrama generado automáticamente a partir de esa plantilla,
+  sin necesidad de crear el stack.
+- Esa plantilla de ejemplo (ALB + Auto Scaling + RDS Multi-AZ) es cara de desplegar solo para
+  ver la pantalla de creación, así que la práctica real de la 80 se hace con la plantilla propia
+  del curso (una sola instancia EC2), subida como fichero.
+- **Ojo con la región.** La plantilla del curso trae fijados un `ImageId` (AMI) y un
+  `InstanceType` de `us-east-1`. Los IDs de AMI son específicos de cada región y `t2.micro` no
+  existe en todas partes (en `eu-north-1`, por ejemplo, el equivalente es `t3.micro`). Si se
+  trabaja fuera de `us-east-1`, o se cambian esos dos valores a mano, o se hace la práctica en
+  `us-east-1` como en el curso.
+
+### Tags
+
+Además de los que pone CloudFormation automáticamente en cada recurso
+(`aws:cloudformation:stack-name`, `aws:cloudformation:logical-id`, `aws:cloudformation:stack-id`)
+se pueden añadir tags propios de dos formas:
+
+- **Por recurso**, con la propiedad `Tags` dentro de `Properties`. El tag reservado `Name` es el
+  que hace que el recurso muestre nombre en la consola (por ejemplo, en la lista de instancias
+  EC2).
+- **A nivel de stack**, en el paso *Configure stack options* de la consola. Esos tags se aplican
+  automáticamente a todos los recursos del stack que admitan tags.
+
+---
+
+## Práctica: Update & Delete Stack (lección 81)
+
+Se actualiza el mismo stack de la 80 con una plantilla nueva que añade una Elastic IP y dos
+security groups (SSH y HTTP/HTTPS), y que introduce un **parámetro**
+(`SecurityGroupDescription`).
+
+- **Update stack → Replace existing template → Upload a template file.** Al subir la nueva
+  plantilla, CloudFormation la sube a un bucket `cf-templates-...` distinto del de la creación,
+  y expone una nueva **Amazon S3 URL**.
+- Si la plantilla define un `Parameters`, aparece un paso adicional (**Specify stack details**)
+  para darle valor. Es el mismo mecanismo de la 79, aplicado ahora a una actualización.
+- **Change set preview**: antes de aplicar el cambio, CloudFormation muestra qué va a pasar,
+  recurso por recurso, con una columna **Action** (`Add`, `Modify`, `Remove`) y una columna
+  **Replacement**. `Replacement: True` en un recurso `Modify` significa que ese recurso no se
+  puede actualizar in situ: hay que destruirlo y recrearlo. En la práctica, añadir
+  `SecurityGroups` a la instancia EC2 provoca ese reemplazo de `MyInstance`, aunque el resto de
+  cambios (Elastic IP y los dos security groups nuevos) son simples altas.
+- **Delete stack** pide escribir el nombre del stack para confirmar, y borra **todos** los
+  recursos que pertenecen al stack, incluida la Elastic IP creada en la actualización. Como todo
+  lo usado en la práctica lo creó el propio stack, no hace falta limpiar nada aparte: borrar el
+  stack es la limpieza completa.
+
+---
+
 ## Building blocks de una plantilla
 
 ### Componentes
@@ -133,3 +192,8 @@ trasladan casi directamente a Terraform.
 | Único componente obligatorio | `Resources` |
 | `AWSTemplateFormatVersion` | `"2010-09-09"` |
 | Parameters vs Mappings | Parameters = entradas **dinámicas**; Mappings = variables **estáticas** |
+| Tags automáticos | `aws:cloudformation:stack-name`, `logical-id`, `stack-id`. No se pueden quitar |
+| Tags propios | Por recurso (`Tags` en `Properties`, tag `Name` da nombre visible) o por stack (*Configure stack options*) |
+| Update Stack | *Replace existing template* + nueva S3 URL o fichero. Si hay `Parameters`, pide valores |
+| Change set | Vista previa por recurso: **Action** (Add / Modify / Remove) y **Replacement** (True = se destruye y recrea) |
+| Delete Stack | Pide confirmar escribiendo el nombre. Borra todos los recursos del stack, sin excepciones manuales |

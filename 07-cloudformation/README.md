@@ -2,9 +2,9 @@
 
 Notas de la Sección 7 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 79 a 81 completadas: qué es CloudFormation, ventajas,
-> funcionamiento, formas de desplegar plantillas, componentes de una plantilla y prácticas de
-> Create, Update y Delete Stack.
+> Sección en curso. Lecciones 79 a 83 completadas: qué es CloudFormation, ventajas,
+> funcionamiento, formas de desplegar plantillas, componentes de una plantilla, prácticas de
+> Create, Update y Delete Stack, YAML y el componente `Resources`.
 
 ---
 
@@ -138,6 +138,53 @@ security groups (SSH y HTTP/HTTPS), y que introduce un **parámetro**
 
 ---
 
+## `Resources` (lección 83)
+
+Es el único componente **obligatorio** de una plantilla: sin `Resources` no hay plantilla válida.
+Representa los componentes de AWS que se van a crear y configurar, y los recursos declarados
+dentro pueden **referenciarse entre sí**.
+
+CloudFormation se encarga de resolver el **orden de creación, actualización y borrado** de todos
+los recursos declarados. Hay más de 700 tipos de recursos soportados.
+
+### Identificador de un tipo de recurso
+
+```
+service-provider::service-name::data-type-name
+```
+
+Por ejemplo, `AWS::EC2::Instance`. Con la práctica se acaba reconociendo el patrón sin mirar la
+documentación, pero para lo que no se sabe de memoria está la **Template Reference** de AWS
+(`docs.aws.amazon.com/AWSCloudFormation/.../aws-resource-<servicio>-<recurso>.html`): cada página
+lista, en YAML y JSON, todas las propiedades del recurso y si son obligatorias u opcionales, y
+cada propiedad compleja (por ejemplo `BlockDeviceMappings`) enlaza a su propia página de
+sub-propiedades. Es la forma de "encadenar" hacia abajo hasta llegar a tipos simples (`String`,
+`Boolean`, `Integer`).
+
+### FAQ
+
+| Pregunta | Respuesta |
+|---|---|
+| ¿Se puede crear un número dinámico de recursos? | Sí, con **CloudFormation Macros** y **Transform**. Fuera del alcance del curso |
+| ¿Están soportados todos los servicios de AWS? | Casi todos. Para los pocos que no lo están, existe el workaround de **CloudFormation Custom Resources** |
+
+### Práctica libre: plantilla EC2 adaptada a `eu-north-1` con UserData
+
+Por mi cuenta, después del vídeo, he escrito una plantilla desde cero (sin partir de las del
+repo del curso) para practicar cómo moverse por la Template Reference:
+
+- Cambié `AvailabilityZone` a `eu-north-1`, y busqué el `ImageId` correcto para esa región en el
+  **AMI Catalog** de la consola de EC2 (Amazon Linux 2023, kernel 6.18) en vez de copiar el de
+  `us-east-1`.
+- Cambié `InstanceType` a `t3.nano`.
+- Añadí una propiedad `UserData` con `Fn::Base64: !Sub |` seguido del script de instalación de
+  Apache. Es la primera vez que meto un `UserData` **dentro de una plantilla de CloudFormation**:
+  el script va como un bloque de texto multilínea (lo visto en YAML Crash Course) envuelto en
+  `Fn::Base64`, porque EC2 espera el user data codificado en Base64, y CloudFormation lo codifica
+  él solo a partir del texto plano.
+
+---
+
 ## Building blocks de una plantilla
 
 ### Componentes
@@ -197,3 +244,6 @@ trasladan casi directamente a Terraform.
 | Update Stack | *Replace existing template* + nueva S3 URL o fichero. Si hay `Parameters`, pide valores |
 | Change set | Vista previa por recurso: **Action** (Add / Modify / Remove) y **Replacement** (True = se destruye y recrea) |
 | Delete Stack | Pide confirmar escribiendo el nombre. Borra todos los recursos del stack, sin excepciones manuales |
+| Tipo de recurso | `service-provider::service-name::data-type-name`, ej. `AWS::EC2::Instance` |
+| Número dinámico de recursos | Con Macros y Transform (fuera del curso) |
+| Servicio de AWS no soportado | Workaround con CloudFormation Custom Resources |

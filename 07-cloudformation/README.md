@@ -2,10 +2,10 @@
 
 Notas de la Sección 7 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 79 a 87 completadas: qué es CloudFormation, ventajas,
+> Sección en curso. Lecciones 79 a 90 completadas: qué es CloudFormation, ventajas,
 > funcionamiento, formas de desplegar plantillas, componentes de una plantilla, prácticas de
 > Create, Update y Delete Stack, YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con
-> exports y `Conditions`.
+> exports, `Conditions`, funciones intrínsecas, rollbacks y service role.
 
 ---
 
@@ -452,6 +452,147 @@ qué hacen y cómo se aplican a recursos y outputs.
 
 ---
 
+## Funciones intrínsecas (lección 88)
+
+Las que hay que conocer sí o sí para el examen: `Ref`, `Fn::GetAtt`, `Fn::FindInMap`,
+`Fn::ImportValue`, `Fn::Base64` y las de condiciones (`Fn::If`, `Fn::Not`, `Fn::Equals`…). Existen
+más (`Fn::Join`, `Fn::Sub`, `Fn::Select`, `Fn::GetAZs`, `Fn::Split`, `Fn::Cidr`…), todas en la
+documentación. Casi todas ya las había usado en mis plantillas o salieron en lecciones anteriores.
+
+- La **forma corta con `!`** (`!Ref`, `!GetAtt`, `!Sub`…) **solo existe en YAML**. En JSON va
+  siempre la forma larga: `{"Fn::GetAtt": ["EC2Instance", "PublicDnsName"]}`.
+- No se puede poner una forma corta justo detrás de `!Base64` (`!Base64 !Sub "..."` no vale). Por
+  eso en el UserData se escribe `Fn::Base64: !Sub |`: forma larga fuera, corta dentro.
+
+### `Ref` frente a `Fn::GetAtt`
+
+| Función | Sobre un parámetro | Sobre un recurso |
+|---|---|---|
+| `!Ref` | Devuelve el valor del parámetro | Devuelve **un único valor por defecto** que decide AWS según el tipo: el ID de la instancia EC2, el **nombre** de un bucket S3… |
+| `!GetAtt Recurso.Atributo` | — | Devuelve **otro atributo** del recurso (ARN, `PublicDnsName`, `PublicIp`…) |
+
+Solo existen los atributos que AWS ha decidido exponer. Qué devuelve cada uno está en la página del
+recurso en la Template Reference, sección **Return values** (apartados *Ref* y *Fn::GetAtt*).
+
+Ejemplo de la lección: un registro CNAME de Route 53 que apunta al `PublicDnsName` de una instancia
+creada en la misma plantilla (`- !GetAtt EC2Instance.PublicDnsName`).
+
+**`!Ref` y `!GetAtt` crean dependencias implícitas**: CloudFormation crea primero el recurso
+referenciado (la instancia) y después el que lo usa (el registro DNS). Así resuelve el orden de
+creación.
+
+---
+
+## Rollbacks (lección 89)
+
+| Caso | Estado final | Qué implica |
+|---|---|---|
+| Falla la **creación** (por defecto) | `ROLLBACK_COMPLETE` | Se borra todo, pero el stack sigue en la lista. En ese estado **no se puede actualizar**: hay que borrarlo y crearlo de nuevo |
+| Falla la creación con **Disable rollback** | `CREATE_FAILED` | Lo que se creó bien **se conserva** para investigar, y factura hasta que se borre el stack |
+| Falla un **update** | `UPDATE_ROLLBACK_COMPLETE` | El stack vuelve solo al último estado bueno. El log de eventos muestra qué pasó |
+| Falla el **rollback** de un update | `UPDATE_ROLLBACK_FAILED` | Hay que arreglar los recursos a mano y lanzar **`ContinueUpdateRollback`** (consola o `aws cloudformation continue-update-rollback`) |
+
+Se parece a una **transacción de MySQL** (`BEGIN` … `ROLLBACK`, todo o nada). El
+`UPDATE_ROLLBACK_FAILED` sería un `ROLLBACK` que se queda a medias y obliga a arreglar a mano
+antes de seguir.
+
+La opción está en *Configure stack options → Stack deployment options → Behavior on provisioning
+failure*: **Roll back all resources** o **Disable rollback** (*Preserve successfully provisioned
+resources*).
+
+### Práctica
+
+Con `2-trigger-failure.yaml` en `us-east-1`:
+
+1. **Stack `TriggerCreationFailure`, rollback desactivado.** Terminó en `CREATE_FAILED`:
+   `ServerSecurityGroup` falló, `SSHSecurityGroup` quedó en `CREATE_COMPLETE` y la instancia **ni
+   se intentó** (dependencia implícita: la instancia hace `!Ref` a los dos security groups). Lo que
+   se creó bien siguió vivo hasta borrar el stack.
+2. **Stack `FailureOnUpdate`**: creado con `0-just-ec2.yaml` y actualizado con
+   `2-trigger-failure.yaml` mediante change set. Crear el change set **no cambia nada**: es solo la
+   vista previa (*Execution status: AVAILABLE*). Hasta pulsar **Execute change set** no se aplica.
+3. Ese update **no falló**: con los valores que di, la plantilla no tenía nada inválido, y el
+   stack acabó en `UPDATE_COMPLETE` con la instancia reemplazada. Para forzar el fallo puse a mano
+   una **AMI inexistente**: el update falló al reemplazar la instancia y el stack volvió solo al
+   estado anterior, con la instancia original intacta.
+
+Conclusiones:
+
+- **El diagnóstico sale de la pestaña Events**, del *Status reason* del evento `CREATE_FAILED` o
+  `UPDATE_FAILED`, no de adivinar mirando la plantilla. Yo di por hecho que fallaba la AMI y era
+  un security group.
+- Una **AMI inexistente no la detecta nadie antes de desplegar**: ni cfn-lint ni el change set,
+  que se crea sin problema. Solo falla al ejecutar, y para eso está el rollback.
+- Los **stacks borrados** se pueden consultar con *Filter status → Deleted*, eventos incluidos.
+- La consola trae opciones nuevas en el change set (*Express mode*, *Deployment validations*,
+  *Resource auto-import*) que no salen en el curso ni entran en el examen.
+
+**Limpieza:** borrar los dos stacks, comprobar en EC2 que las instancias quedan en `terminated` y
+que no queda ninguna Elastic IP, y vaciar y borrar el bucket `cf-templates-...-us-east-1`.
+
+---
+
+## Service role (lección 90)
+
+Rol de IAM que **CloudFormation asume** para crear, actualizar y borrar los recursos del stack en
+nombre del usuario. Sirve para aplicar **mínimo privilegio**: el usuario puede gestionar stacks sin
+tener permisos directos sobre los recursos que esos stacks crean.
+
+| Quién | Qué necesita |
+|---|---|
+| **Usuario** | `cloudformation:*` (manejar stacks, nada más) + **`iam:PassRole`** sobre el ARN del rol |
+| **Service role** | Trust policy con `"Service": "cloudformation.amazonaws.com"` + los permisos sobre los recursos (en la demo, S3) |
+
+- Un usuario con `cloudformation:*` e `iam:PassRole` sobre un rol que solo tiene S3 puede desplegar
+  stacks que crean buckets, pero **no puede tocar S3** desde la consola o la CLI. Si mete una
+  instancia EC2 en la plantilla, el stack falla.
+- Todo cambio pasa por una plantilla: queda versionado y con su historial de eventos. En
+  CloudTrail aparece el `CreateStack` con la identidad del usuario, y las llamadas a S3, hechas por
+  el rol.
+- El rol **se elige por stack** (*Configure stack options → Permissions*). Uno puede servir para
+  muchos stacks. Si no se elige ninguno, CloudFormation usa los permisos del usuario.
+- Una vez asociado, CloudFormation lo usa en **todas** las operaciones del stack, incluido el
+  delete. **Si se borra el rol antes que el stack, el stack ya no se puede borrar.**
+- Que la demo le dé `AmazonS3FullAccess` al rol es por simplificar. En producción, el mínimo
+  privilegio se aplica en el rol: solo las acciones necesarias y sobre ARNs concretos.
+
+### `iam:PassRole`
+
+**No es un rol, es un permiso**: el de **entregarle un rol a un servicio** de AWS para que actúe
+con él. No es exclusivo de CloudFormation: hace falta en todo servicio al que se le asigna un rol
+(el instance profile de EC2, como `AmazonEC2RoleForSSM` en la Sección 5; el rol de ejecución de
+Lambda; los roles de tareas de ECS…). Con un usuario administrador va incluido y no se nota.
+
+Sin controlarlo hay **escalada de privilegios**: un usuario que solo puede lanzar instancias podría
+asignarles un rol de administrador, entrar en la instancia y usar esos permisos. Por eso se limita
+al ARN del rol concreto:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::123456789012:role/CFN-S3"
+}
+```
+
+Mi analogía en Linux: es como el permiso de decidir con qué usuario corre el pool de **php-fpm**
+(`user = www-data`). Si cualquiera puede poner `user = root` y luego subir un `.php`, ya es root.
+Si solo puede elegir `www-data`, lo peor que puede hacer su código es lo que `www-data` tenga
+permitido.
+
+### Práctica
+
+Rol creado en IAM con *AWS service → CloudFormation* y `AmazonS3FullAccess`, y un stack que lo usa
+con una plantilla que incluye una instancia EC2: **falla**, aunque mi usuario `roberto-admin` sí
+puede crear instancias. Quien crea los recursos es CloudFormation con el rol, así que los permisos
+que cuentan son los del rol. Si un stack con service role falla por permisos, se amplía el **rol**,
+no el usuario.
+
+**Limpieza, en este orden:** primero el stack (en `ROLLBACK_COMPLETE`, sin recursos), después el
+rol de IAM y, por último, el bucket `cf-templates-...-us-east-1`.
+
+---
+
 ## Building blocks de una plantilla
 
 ### Componentes
@@ -527,3 +668,14 @@ trasladan casi directamente a Terraform.
 | Outputs | Opcionales. Con `Export` → otros stacks los importan con `Fn::ImportValue` |
 | Exports | Nombre único por cuenta y región, solo misma región. No se puede borrar ni modificar lo exportado mientras esté importado |
 | Conditions | Crean o no recursos / outputs. `Fn::And`, `Equals`, `If`, `Not`, `Or` |
+| Funciones que hay que saber | `Ref`, `GetAtt`, `FindInMap`, `ImportValue`, `Base64` y las de condiciones |
+| Forma corta `!` | Solo en YAML. En JSON, `{"Fn::...": ...}` |
+| `Ref` vs `GetAtt` | `Ref` = valor por defecto del recurso (ID de EC2, nombre de bucket). `GetAtt` = otros atributos (ARN, `PublicDnsName`…). Ver *Return values* en la documentación |
+| Dependencias implícitas | `Ref` y `GetAtt` hacen que el recurso referenciado se cree antes |
+| Falla la creación | Rollback de todo → `ROLLBACK_COMPLETE` (no actualizable: borrar y recrear). Opción de desactivar el rollback para investigar |
+| Falla un update | Vuelve al último estado bueno → `UPDATE_ROLLBACK_COMPLETE` |
+| `UPDATE_ROLLBACK_FAILED` | Arreglar los recursos a mano + `ContinueUpdateRollback` |
+| Change set | Solo vista previa hasta *Execute change set* |
+| Service role | Rol que asume CloudFormation. El usuario necesita `cloudformation:*` + `iam:PassRole`, no permisos sobre los recursos |
+| `iam:PassRole` | Permiso para entregar un rol a un servicio. Limitarlo al ARN concreto para evitar escalada de privilegios |
+| Borrar un rol en uso | Si se borra antes que su stack, el stack ya no se puede borrar |

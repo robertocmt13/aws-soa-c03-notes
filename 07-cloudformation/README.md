@@ -2,10 +2,13 @@
 
 Notas de la Sección 7 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 79 a 90 completadas: qué es CloudFormation, ventajas,
-> funcionamiento, formas de desplegar plantillas, componentes de una plantilla, prácticas de
-> Create, Update y Delete Stack, YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con
-> exports, `Conditions`, funciones intrínsecas, rollbacks y service role.
+> Sección en curso. Lecciones 79 a 98 completadas, con lo que queda cerrada la parte de repaso
+> reutilizada del curso de Developer (`[DVA]`): qué es CloudFormation, ventajas, funcionamiento,
+> formas de desplegar plantillas, componentes de una plantilla, prácticas de Create, Update y
+> Delete Stack, YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con exports,
+> `Conditions`, funciones intrínsecas, rollbacks, service role, capabilities, políticas de
+> borrado y reemplazo, stack policy, termination protection, custom resources y dynamic
+> references. A partir de la 99 empiezan las lecciones específicas de CloudOps.
 
 ---
 
@@ -593,6 +596,181 @@ rol de IAM y, por último, el bucket `cf-templates-...-us-east-1`.
 
 ---
 
+## Capabilities (lección 91)
+
+Es una **confirmación explícita** que CloudFormation exige antes de desplegar ciertas plantillas:
+"sé que esta plantilla va a tocar IAM" o "sé que se va a transformar antes de desplegarse". Es una
+medida de seguridad: una plantilla que crea roles o políticas puede dar más permisos de los
+debidos (la escalada de privilegios de la 90), y AWS no deja hacerlo sin darse cuenta.
+
+| La plantilla… | Capability |
+|---|---|
+| Crea o modifica recursos de IAM (rol, usuario, grupo, política, access keys, instance profile) **sin nombre fijo** | `CAPABILITY_IAM` |
+| Lo mismo, pero **con nombre fijo** (`RoleName: MiRol`, `UserName: deploy`…) | `CAPABILITY_NAMED_IAM` |
+| Usa **macros** / `Transform` o **nested stacks** | `CAPABILITY_AUTO_EXPAND` |
+
+- `CAPABILITY_NAMED_IAM` incluye lo de `CAPABILITY_IAM`. Se pueden pasar varias a la vez.
+- **Consola**: en *Review and create* aparece una casilla del tipo *"I acknowledge that AWS
+  CloudFormation might create IAM resources"*, y si hay nombres fijos añade *"with custom names"*.
+  CloudFormation detecta cuál hace falta.
+- **CLI**: hay que saber cuál poner: `--capabilities CAPABILITY_IAM`.
+- Si no se da, el despliegue falla con **`InsufficientCapabilitiesException`**.
+
+**Práctica:** stack con `3-capabilities.yaml`: apareció la casilla de confirmación de IAM antes de
+crear. Limpieza: borrar el stack (se lleva el recurso de IAM) y el bucket `cf-templates-...`.
+
+---
+
+## DeletionPolicy (lección 92)
+
+Controla qué pasa con un recurso cuando **se borra el stack** o cuando **se quita el recurso de la
+plantilla** en un update. Es una medida extra para conservar datos o hacer copia antes de borrar.
+
+| Policy | Qué pasa con el recurso | Qué queda | Válido para |
+|---|---|---|---|
+| `Delete` | Se borra | Nada | Casi todo. **Es el valor por defecto** |
+| `Retain` | Sigue vivo, pero CloudFormation deja de gestionarlo | El recurso entero, facturando | **Cualquier** recurso |
+| `Snapshot` | Se hace una copia final y luego se borra | El snapshot, facturando por almacenamiento | Solo recursos con snapshots: EBS, ElastiCache, RDS, Redshift, Neptune, DocumentDB |
+
+- **Excepción al valor por defecto:** en RDS (`AWS::RDS::DBCluster` y `AWS::RDS::DBInstance` sin
+  cluster) el valor por defecto es **`Snapshot`**.
+- **`Delete` no funciona en un bucket S3 con objetos**: igual que `rmdir` con un directorio lleno,
+  el borrado falla y el stack se queda en `DELETE_FAILED`. Soluciones: vaciarlo a mano (como el
+  `cf-templates-...`), `DeletionPolicy: Retain` o un custom resource que lo vacíe (lección 96).
+- Lo retenido y los snapshots **ya no pertenecen a ningún stack**: hay que borrarlos a mano.
+
+No hice la práctica: solo muestra que, tras borrar el stack, quedan el recurso retenido y el
+snapshot.
+
+---
+
+## UpdateReplacePolicy (lección 93)
+
+Mismos valores (`Delete`, `Retain`, `Snapshot`), pero aplicados cuando un **update obliga a
+reemplazar** el recurso (el `Replacement: True` del change set): decide qué pasa con el **recurso
+viejo**. No se aplica en updates sin reemplazo.
+
+**`DeletionPolicy` no protege en un reemplazo.** Una base de datos con `DeletionPolicy: Snapshot`
+está protegida si se borra el stack, pero si un update la reemplaza, la vieja se borra sin
+snapshot, salvo que también tenga `UpdateReplacePolicy: Snapshot`. Para un recurso crítico se
+ponen **las dos**.
+
+---
+
+## Stack Policy (lección 94)
+
+Documento JSON que se aplica **sobre el stack** (no dentro de la plantilla) y decide **qué recursos
+se pueden actualizar**. Solo afecta a **updates**.
+
+- **Al poner una stack policy, todos los recursos quedan protegidos por defecto.** Hay que añadir
+  un `Allow` explícito para lo que sí se pueda actualizar. Lo típico: permitir `Update:*` sobre
+  todo y denegarlo solo sobre el recurso crítico.
+- **No protege contra el borrado del stack**: para eso está la termination protection.
+- Para actualizar un recurso protegido se puede pasar una **policy temporal** solo para ese update.
+
+| Mecanismo | Dónde va | Protege frente a |
+|---|---|---|
+| `DeletionPolicy` / `UpdateReplacePolicy` | En la plantilla, en cada recurso | Perder el recurso al borrarlo o reemplazarlo |
+| Stack Policy | Sobre el stack | Updates de recursos concretos |
+| Termination Protection | Sobre el stack | Borrar el stack |
+
+---
+
+## Termination Protection (lección 95)
+
+Impide **borrar el stack** por accidente. Se activa al crear el stack (en las opciones) o después
+(*Stack actions → Edit termination protection*). Mientras esté activa, Delete stack falla: hay que
+desactivarla antes de poder borrarlo.
+
+---
+
+## Custom Resources (lección 96)
+
+Se usan para:
+
+- Recursos que **CloudFormation aún no soporta**.
+- Lógica de aprovisionamiento propia para recursos **fuera de CloudFormation** (on-premises, de
+  terceros…).
+- Ejecutar **scripts propios** durante create / update / delete. El ejemplo típico: **vaciar un
+  bucket S3 antes de que CloudFormation lo borre**.
+
+```yaml
+Resources:
+  MyCustomResourceUsingLambda:
+    Type: Custom::MyLambdaResource
+    Properties:
+      ServiceToken: arn:aws:lambda:REGION:ACCOUNT_ID:function:FUNCTION_NAME
+      # Input values (optional)
+      ExampleProperty: "ExampleValue"
+```
+
+- Se definen con `AWS::CloudFormation::CustomResource` o, **recomendado**,
+  `Custom::MiNombreDeTipo`.
+- Detrás hay una **Lambda** (lo más habitual) o un **topic de SNS**.
+- **`ServiceToken`**: ARN de la Lambda o el topic al que CloudFormation envía las peticiones.
+  Obligatorio y en la **misma región**. El resto de propiedades son datos de entrada opcionales.
+- El custom resource no lleva el código: apunta a la Lambda, que puede estar en la misma plantilla
+  o existir por su cuenta.
+
+Funciona como un **webhook**: CloudFormation le envía el evento (`Create`, `Update` o `Delete`) con
+los datos, la Lambda ejecuta su lógica y **responde** si ha ido bien o mal. Si nunca responde, el
+stack se queda colgado en `IN_PROGRESS` hasta el timeout.
+
+---
+
+## Dynamic References (lección 97)
+
+Permiten leer valores guardados en **SSM Parameter Store** y **Secrets Manager** desde la
+plantilla. CloudFormation los resuelve durante las operaciones de create / update / delete.
+Sintaxis: `'{{resolve:service-name:reference-key}}'`.
+
+| Tipo | Lee de | Ejemplo |
+|---|---|---|
+| `ssm` | Parameter Store, texto plano | `'{{resolve:ssm:S3AccessControl:2}}'` |
+| `ssm-secure` | Parameter Store, `SecureString` | `'{{resolve:ssm-secure:IAMUserPassword:10}}'` |
+| `secretsmanager` | Secrets Manager | `'{{resolve:secretsmanager:MyRDSSecret:SecretString:password}}'` |
+
+- Es la alternativa segura a `NoEcho` (lección 84): el secreto **no aparece** en la plantilla ni en
+  la consola.
+- CloudFormation **no puede crear** parámetros `SecureString` (`AWS::SSM::Parameter` solo admite
+  `String` y `StringList`), aunque sí puede **leerlos** con `ssm-secure`, solo en algunas
+  propiedades.
+- Para datos no secretos sí puede crear parámetros, por ejemplo guardar el endpoint de una base de
+  datos para que lo lean otras aplicaciones:
+
+  ```yaml
+  DBEndpointParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /miapp/prod/db-endpoint
+      Type: String
+      Value: !GetAtt MyDB.Endpoint.Address
+  ```
+
+### Contraseña de RDS: dos opciones
+
+| | Opción 1: `ManageMasterUserPassword: true` | Opción 2: dynamic reference |
+|---|---|---|
+| Quién crea el secreto | **RDS**, automáticamente en Secrets Manager | Yo, con `AWS::SecretsManager::Secret` y `GenerateSecretString` |
+| Cuánto hay que escribir | Una línea | El secreto + `{{resolve:secretsmanager:...}}` en `MasterUsername` / `MasterUserPassword` + `AWS::SecretsManager::SecretTargetAttachment` |
+| Rotación | La gestiona RDS | El `SecretTargetAttachment` enlaza secreto e instancia para la rotación |
+| Control | Menos | Total: nombre, longitud, caracteres excluidos… |
+
+La opción 1 es la cómoda y la respuesta si piden la forma más sencilla con rotación gestionada. El
+ARN del secreto se obtiene con `!GetAtt MyCluster.MasterUserSecret.SecretArn`. La opción 2 es el
+patrón general, válido para cualquier recurso que necesite un secreto.
+
+---
+
+## Fin de la parte `[DVA]` (lección 98)
+
+Las lecciones 80 a 97 marcadas como `[DVA]` son el repaso de CloudFormation reutilizado del curso
+de Developer Associate. Desde la 99 empiezan las específicas del examen de **SysOps** (el nombre
+anterior del SOA-C03). Las lecciones están grabadas con la consola antigua: las plantillas siguen
+siendo válidas, pero la interfaz ha cambiado.
+
+---
+
 ## Building blocks de una plantilla
 
 ### Componentes
@@ -679,3 +857,12 @@ trasladan casi directamente a Terraform.
 | Service role | Rol que asume CloudFormation. El usuario necesita `cloudformation:*` + `iam:PassRole`, no permisos sobre los recursos |
 | `iam:PassRole` | Permiso para entregar un rol a un servicio. Limitarlo al ARN concreto para evitar escalada de privilegios |
 | Borrar un rol en uso | Si se borra antes que su stack, el stack ya no se puede borrar |
+| Capabilities | `CAPABILITY_IAM` (IAM sin nombre), `CAPABILITY_NAMED_IAM` (con nombre fijo), `CAPABILITY_AUTO_EXPAND` (macros, nested stacks). Sin ella → `InsufficientCapabilitiesException` |
+| DeletionPolicy | `Delete` (por defecto; `Snapshot` en RDS), `Retain` (cualquier recurso), `Snapshot` (EBS, RDS, ElastiCache, Redshift, Neptune, DocumentDB) |
+| Bucket S3 con objetos | `Delete` falla → `DELETE_FAILED`. Vaciar, `Retain` o custom resource |
+| UpdateReplacePolicy | Igual, pero para el recurso viejo en un reemplazo. `DeletionPolicy` no protege ahí: poner las dos |
+| Stack Policy | JSON sobre el stack que protege frente a **updates**. Al ponerla, todo protegido por defecto |
+| Termination Protection | Impide borrar el stack. Desactivarla antes de borrar |
+| Custom resources | `Custom::Nombre` + `ServiceToken` (Lambda o SNS, misma región). Ej.: vaciar un bucket antes de borrarlo |
+| Dynamic references | `{{resolve:ssm / ssm-secure / secretsmanager:...}}`. CloudFormation no crea `SecureString` |
+| RDS + Secrets Manager | `ManageMasterUserPassword: true` (sencillo, rotación gestionada) o secreto propio + dynamic reference + `SecretTargetAttachment` |

@@ -2,13 +2,14 @@
 
 Notas de la Sección 7 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 79 a 98 completadas, con lo que queda cerrada la parte de repaso
-> reutilizada del curso de Developer (`[DVA]`): qué es CloudFormation, ventajas, funcionamiento,
-> formas de desplegar plantillas, componentes de una plantilla, prácticas de Create, Update y
-> Delete Stack, YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con exports,
-> `Conditions`, funciones intrínsecas, rollbacks, service role, capabilities, políticas de
-> borrado y reemplazo, stack policy, termination protection, custom resources y dynamic
-> references. A partir de la 99 empiezan las lecciones específicas de CloudOps.
+> Sección en curso. Lecciones 79 a 102 completadas. La parte de repaso reutilizada del curso de
+> Developer (`[DVA]`, lecciones 79 a 98): qué es CloudFormation, ventajas, funcionamiento, formas de
+> desplegar plantillas, componentes de una plantilla, prácticas de Create, Update y Delete Stack,
+> YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con exports, `Conditions`, funciones
+> intrínsecas, rollbacks, service role, capabilities, políticas de borrado y reemplazo, stack
+> policy, termination protection, custom resources y dynamic references. Y las primeras lecciones
+> específicas de CloudOps (99 a 102): user data, `cfn-init`, `cfn-signal` con wait conditions y
+> sus fallos.
 
 ---
 
@@ -771,6 +772,209 @@ siendo válidas, pero la interfaz ha cambiado.
 
 ---
 
+## User Data (lección 99)
+
+Primera lección específica de CloudOps. El `UserData` de una instancia EC2 se puede escribir
+dentro de la plantilla, igual que en la consola al lanzar la instancia. Lo importante es pasar
+**el script entero por `Fn::Base64`**.
+
+```yaml
+UserData:
+  Fn::Base64: |
+    #!/bin/bash -xe
+    dnf update -y
+    dnf install -y httpd
+    systemctl start httpd
+    systemctl enable httpd
+    echo "<h1>Hello World from user data</h1>" > /var/www/html/index.html
+```
+
+- La salida del script queda en **`/var/log/cloud-init-output.log`**, dentro de la instancia. Es
+  lo único realmente nuevo respecto a mi práctica libre de la 83.
+- La plantilla del curso no usa `!Sub` porque el script no tiene variables. Aun así escribe
+  `Fn::Base64:` en forma larga: si luego hace falta un `!Sub`, ya está preparado (dos formas
+  cortas seguidas, `!Base64 !Sub`, no valen en YAML, ver lección 88).
+- **`#!/bin/bash -xe`**: `-x` imprime cada comando antes de ejecutarlo (las líneas con `+`
+  delante en el log, que dicen en qué paso se ha quedado el script) y `-e` corta el script en el
+  primer comando que falle.
+
+### Cómo sabe YAML dónde termina el bloque `|`
+
+Por la **indentación**, como Python. La sangría del bloque la fija su primera línea con
+contenido, y el bloque termina en la primera línea con **menos** sangría. Las líneas vacías
+intermedias siguen dentro. Es como un heredoc de bash (`<<EOF`), pero sin delimitador de cierre.
+
+```yaml
+UserData:
+  Fn::Base64: |
+    #!/bin/bash -xe      ← marca la sangría del bloque
+    dnf install -y httpd
+                         ← línea vacía: sigue dentro
+  # comentario           ← menos sangría: aquí termina
+```
+
+- La sangría base **se elimina** del contenido: el script llega a EC2 con el `#!/bin/bash` en la
+  columna 0, que es donde tiene que estar el shebang.
+- `|` conserva un salto de línea final, `|-` ninguno y `|+` todos. `>` une las líneas en una sola,
+  así que para scripts siempre `|`.
+
+### El problema
+
+CloudFormation marca la instancia como `CREATE_COMPLETE` en cuanto EC2 la lanza, **no cuando
+termina el user data**. Si el script falla a mitad, el stack sale en verde igualmente. Es lo que
+resuelven las lecciones siguientes.
+
+**Práctica** (`0-user-data.yaml`, `us-east-1`): stack con instancia y security group, página de
+Apache visible en la IP pública y log revisado por EC2 Instance Connect.
+
+---
+
+## `cfn-init` (lección 100)
+
+Los problemas del user data que plantea el curso: configuraciones muy grandes, cómo cambiar el
+estado de la instancia **sin terminarla y crear otra**, cómo hacerlo más legible y cómo saber si
+el script ha terminado bien.
+
+La respuesta son los **CloudFormation Helper Scripts**: scripts de Python que vienen en las AMIs de
+Amazon Linux (en otras se instalan con `yum` o `dnf`): **`cfn-init`**, **`cfn-signal`**,
+`cfn-get-metadata` y **`cfn-hup`**. Se ejecutan **dentro de la instancia**.
+
+La configuración se declara en la `Metadata` del recurso, en `AWS::CloudFormation::Init`, y el
+`UserData` se queda en lo mínimo: llamar a `cfn-init`.
+
+```yaml
+MyInstance:
+  Type: AWS::EC2::Instance
+  Properties:
+    # ...
+    UserData:
+      Fn::Base64:
+        !Sub |
+          #!/bin/bash -xe
+          dnf update -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -s ${AWS::StackId} -r MyInstance --region ${AWS::Region}
+  Metadata:
+    AWS::CloudFormation::Init:
+      config:
+        packages:
+          yum:
+            httpd: []
+        files:
+          "/var/www/html/index.html":
+            content: |
+              <h1>Hello World from EC2 instance!</h1>
+            mode: '000644'
+        commands:
+          hello:
+            command: "echo 'hello world'"
+        services:
+          sysvinit:
+            httpd:
+              enabled: 'true'
+              ensureRunning: 'true'
+```
+
+- Un `config` se ejecuta **siempre en este orden**, lo escriba como lo escriba: `packages` →
+  `groups` → `users` → `sources` → `files` → `commands` → `services`.
+- `cfn-init` va a buscar la `Metadata` a la API de CloudFormation. Por eso recibe el stack (`-s`)
+  y el recurso (`-r`).
+- Es **declarativo**: no se escribe `dnf install` ni `systemctl enable`, se declara el paquete o el
+  servicio y el estado que se quiere.
+- **No es obligatorio.** Para algo pequeño, un `UserData` normal vale. Con 100 paquetes, ficheros y
+  servicios, la `Metadata` se lee mucho mejor que un script largo.
+- **`cfn-init` no avisa a CloudFormation.** Si falla, el stack sale en verde igual que en la 99. Eso
+  lo hace `cfn-signal` (lección 101).
+- **`cfn-hup`**: el `UserData` solo se ejecuta en el primer arranque. Si `cfn-hup` corre en la
+  instancia, detecta cambios en la `Metadata` y vuelve a lanzar `cfn-init`: así se cambia la
+  configuración **sin reemplazar la instancia**.
+- `dnf update -y aws-cfn-bootstrap` devolvió *Nothing to do*: Amazon Linux 2023 ya trae los helper
+  scripts.
+- La línea `|| error_exit 'Failed to run cfn-init'` de la plantilla del curso llama a una función
+  `error_exit` que **no está definida** en el script. En las plantillas de ejemplo de AWS se define
+  al principio.
+
+| Log | Contenido |
+|---|---|
+| `/var/log/cloud-init-output.log` | Salida del `UserData`, incluida la llamada a `cfn-init` con el ARN del stack ya resuelto |
+| `/var/log/cfn-init.log` | Lo que ha hecho `cfn-init`, paso a paso |
+| `/var/log/cfn-init-cmd.log` | Salida de cada `command` |
+
+**Práctica** (`1-cfn-init.yaml`, `us-east-1`): página generada por `cfn-init` y `cfn-init.log` con
+cada paso (paquete instalado, comando, servicio habilitado y arrancado).
+
+---
+
+## `cfn-signal` y Wait Conditions (lección 101)
+
+`cfn-signal` se ejecuta justo después de `cfn-init` y le dice a CloudFormation si la configuración
+ha ido bien o mal. Del otro lado hace falta una **WaitCondition**, que bloquea la plantilla hasta
+recibir la señal.
+
+```yaml
+UserData:
+  Fn::Base64:
+    !Sub |
+      #!/bin/bash -x
+      dnf update -y aws-cfn-bootstrap
+      /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource MyInstance --region ${AWS::Region}
+      INIT_STATUS=$?
+      /opt/aws/bin/cfn-signal -e $INIT_STATUS --stack ${AWS::StackName} --resource SampleWaitCondition --region ${AWS::Region}
+      exit $INIT_STATUS
+
+SampleWaitCondition:
+  CreationPolicy:
+    ResourceSignal:
+      Timeout: PT3M
+      Count: 1
+  Type: AWS::CloudFormation::WaitCondition
+```
+
+- **`INIT_STATUS=$?`** guarda el código de salida de `cfn-init`, se lo pasa a `cfn-signal` con
+  `-e` y el script termina con ese mismo código.
+- **Aquí el shebang es `-x`, sin `-e`, a propósito.** Con `-e`, si falla `cfn-init` el script se
+  corta ahí y nunca llega a `cfn-signal`: el stack esperaría hasta el timeout en vez de fallar en
+  el momento.
+- **`CreationPolicy`**: `Timeout` en formato de duración ISO 8601 (`PT3M` = 3 minutos, `PT5M` = 5)
+  y `Count`, el número de señales necesarias.
+- La `CreationPolicy` también se puede poner **directamente en la instancia EC2 o en un Auto
+  Scaling Group**, y `cfn-signal` apunta a ese recurso. En un ASG, `Count` suele ser el número de
+  instancias.
+
+Me recuerda a JavaScript: es un `await` sobre una promesa con timeout. Se resuelve con la señal de
+éxito y se rechaza con una señal de fallo o al vencer el `Timeout`.
+
+**Práctica** (`2-cfn-signal.yaml`, `us-east-1`): la instancia pasó a `CREATE_COMPLETE` a las
+11:18:25, pero el stack no terminó hasta las 11:19:04, justo después de que `SampleWaitCondition`
+recibiera el *SUCCESS signal* (con el ID de la instancia como `UniqueId`). Esos 40 segundos son lo
+que tarda `cfn-init`. Ahora el verde del stack significa "aplicación configurada", no solo
+"instancia lanzada".
+
+---
+
+## Fallos de `cfn-signal` (lección 102)
+
+Qué revisar cuando la WaitCondition **no recibe las señales** que espera:
+
+- Que la AMI tenga los **helper scripts**. Si no los trae, se pueden descargar a la instancia.
+- Que `cfn-init` y `cfn-signal` se hayan ejecutado bien: `/var/log/cloud-init.log` o
+  `/var/log/cfn-init.log`.
+- Para poder entrar a leer esos logs hay que **desactivar el rollback**: si no, CloudFormation
+  borra la instancia en cuanto falla el stack (ver lección 89).
+- Que la instancia tenga **salida a Internet**, porque los scripts hablan con la API de
+  CloudFormation: por **NAT** si está en una subnet privada o por **Internet Gateway** si está en
+  una pública. Prueba rápida: `curl -I https://aws.amazon.com`.
+
+**Práctica** (`3-cfn-signal-failure.yaml`, `us-east-1`): misma plantilla que la 101 con el comando
+cambiado a `echo 'boom' && exit 1`. Vi dónde iba a fallar antes de que lo dijera el vídeo.
+`cfn-init` falla, `cfn-signal` envía el error y `SampleWaitCondition` pasa a `CREATE_FAILED` con
+*Received FAILURE signal* (marcado como *Likely root cause*), unos 40 segundos después de crearse
+la instancia, sin esperar al timeout. Después, rollback de todo.
+
+**Limpieza de las cuatro prácticas (99 a 102):** borrar cada stack (se lleva la instancia y el
+security group) y vaciar y borrar el bucket `cf-templates-...-us-east-1`.
+
+---
+
 ## Building blocks de una plantilla
 
 ### Componentes
@@ -866,3 +1070,11 @@ trasladan casi directamente a Terraform.
 | Custom resources | `Custom::Nombre` + `ServiceToken` (Lambda o SNS, misma región). Ej.: vaciar un bucket antes de borrarlo |
 | Dynamic references | `{{resolve:ssm / ssm-secure / secretsmanager:...}}`. CloudFormation no crea `SecureString` |
 | RDS + Secrets Manager | `ManageMasterUserPassword: true` (sencillo, rotación gestionada) o secreto propio + dynamic reference + `SecretTargetAttachment` |
+| User data en la plantilla | Script entero por `Fn::Base64`. Log en `/var/log/cloud-init-output.log` |
+| Bloque YAML `\|` | Termina al volver a una sangría menor. `\|` un salto final, `\|-` ninguno, `\|+` todos |
+| Problema del user data | El stack marca la instancia como `CREATE_COMPLETE` al lanzarla, aunque el script falle |
+| Helper scripts | `cfn-init`, `cfn-signal`, `cfn-get-metadata`, `cfn-hup`. Vienen en Amazon Linux; en otras AMIs se instalan |
+| `cfn-init` | Lee `AWS::CloudFormation::Init` de la `Metadata`. Orden: packages → groups → users → sources → files → commands → services. Log en `/var/log/cfn-init.log` |
+| `cfn-hup` | Detecta cambios en la `Metadata` y relanza `cfn-init` sin reemplazar la instancia |
+| `cfn-signal` + WaitCondition | `cfn-signal -e $?` informa del resultado. La `CreationPolicy` (`Timeout`, `Count`) bloquea hasta recibir las señales. También en EC2 y ASG |
+| WaitCondition sin señales | Helper scripts en la AMI, logs de `cfn-init`, desactivar rollback para ver los logs, salida a Internet (NAT o IGW) |

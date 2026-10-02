@@ -2,14 +2,14 @@
 
 Notas de la Sección 7 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 79 a 102 completadas. La parte de repaso reutilizada del curso de
+> Sección en curso. Lecciones 79 a 105 completadas. La parte de repaso reutilizada del curso de
 > Developer (`[DVA]`, lecciones 79 a 98): qué es CloudFormation, ventajas, funcionamiento, formas de
 > desplegar plantillas, componentes de una plantilla, prácticas de Create, Update y Delete Stack,
 > YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con exports, `Conditions`, funciones
 > intrínsecas, rollbacks, service role, capabilities, políticas de borrado y reemplazo, stack
 > policy, termination protection, custom resources y dynamic references. Y las primeras lecciones
-> específicas de CloudOps (99 a 102): user data, `cfn-init`, `cfn-signal` con wait conditions y
-> sus fallos.
+> específicas de CloudOps (99 a 105): user data, `cfn-init`, `cfn-signal` con wait conditions y
+> sus fallos, nested stacks, `DependsOn` y el aviso de coste de StackSets.
 
 ---
 
@@ -40,6 +40,11 @@ Herramienta visual para plantillas de CloudFormation. Funciona en las dos direcc
 - Se puede **diseñar** arrastrando componentes y genera el YAML.
 
 Las plantillas se escriben en **YAML o JSON**. YAML es lo habitual y lo que usa el curso.
+
+> **Aviso de AWS (octubre de 2026):** se retira la consola independiente de Infrastructure
+> Composer (`console.aws.amazon.com/composer`). El editor visual sigue dentro de la consola de
+> CloudFormation y en VS Code con la extensión AWS Toolkit. Me llegó como evento de **AWS Health**
+> (tipo *scheduledChange*). No afecta a plantillas ni stacks.
 
 ---
 
@@ -975,6 +980,127 @@ security group) y vaciar y borrar el bucket `cf-templates-...-us-east-1`.
 
 ---
 
+## Nested Stacks (lección 103)
+
+Un **nested stack** es un stack que forma parte de otro. Sirve para aislar patrones que se
+repiten (la configuración de un load balancer, un security group) en una plantilla aparte y
+llamarla desde otras. Se considera buena práctica.
+
+```yaml
+Resources:
+  MyKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: DemoKeyPair
+      KeyType: rsa
+
+  myStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://stephane-courses-s3-assets.s3.us-east-1.amazonaws.com/LAMP_Single_Instance.template
+      Parameters:
+        KeyName: !Ref MyKeyPair
+        DBName: "mydb"
+        # ...
+
+Outputs:
+  OutputFromNestedStack:
+    Value: !GetAtt myStack.Outputs.WebsiteURL
+```
+
+- El recurso es de tipo **`AWS::CloudFormation::Stack`** y apunta a la plantilla hija con
+  `TemplateURL` (en S3).
+- El padre le pasa valores con `Parameters` y lee lo que devuelve con
+  **`!GetAtt <nested>.Outputs.<nombre>`**.
+- Un nested stack puede tener sus propios nested stacks (varios niveles).
+- **Para actualizar un nested stack, siempre se actualiza el padre (root stack)**, nunca el hijo
+  directamente.
+- Crear el stack pide **`CAPABILITY_AUTO_EXPAND`** (lección 91) además del aviso de IAM.
+
+Me lo imagino como un **componente de React**: la plantilla hija es el componente, los
+`Parameters` son sus props, los `Outputs` lo que devuelve, y cada uso crea una instancia
+independiente.
+
+### Cross stack frente a nested stack
+
+La diferencia es **compartir un recurso** frente a **reutilizar una plantilla**:
+
+| | Cross stack | Nested stack |
+|---|---|---|
+| Idea | Compartir **un** recurso desplegado una vez | Reutilizar una **plantilla**; cada padre crea su propia copia |
+| Ciclo de vida | Cada stack el suyo | El hijo pertenece al padre: se actualiza y se borra con él |
+| Mecanismo | `Export` + `Fn::ImportValue` | `AWS::CloudFormation::Stack` + `TemplateURL` |
+| Ejemplo | Un stack de VPC cuyo ID usan App 1, App 2 y App 3 | App 1 y App 2 tienen cada una su RDS, su ASG y su ELB, sin compartir nada |
+
+Mis analogías:
+
+- **Cross stack** es como **una base de datos compartida**: una sola instancia con su propio ciclo
+  de vida, a la que se conectan varias aplicaciones. Igual que no se tira una BD con aplicaciones
+  conectadas, CloudFormation no deja borrar un export mientras algún stack lo importe.
+- **Nested stack** es como **un servicio dentro de un `docker-compose`**: la plantilla es la
+  imagen, cada proyecto levanta su propio contenedor, y `docker compose down` se lo lleva por
+  delante (borrar el padre borra el hijo). Tampoco se toca el contenedor a mano: se cambia el
+  compose y se vuelve a aplicar.
+
+**Práctica** (`4-nestedstacks.yaml`, `us-east-1`): la plantilla hija es la de ejemplo de AWS
+`LAMP_Single_Instance` (en JSON, que Stéphane ha copiado a su bucket porque AWS ya no la mantiene).
+Crea una instancia con Apache, PHP y MySQL, y usa `CreationPolicy` con `cfn-signal` como en la
+101: el padre espera al hijo y el hijo espera la señal de su instancia.
+
+- Cambié la contraseña de la base de datos. La plantilla hija tiene `NoEcho` en `DBUser` y
+  `DBPassword`, pero la contraseña sigue **en claro en la plantilla padre**: `NoEcho` no cifra
+  (lección 84). En un caso real, dynamic reference a Secrets Manager (lección 97).
+
+**Limpieza:** borrar el stack padre (se lleva el nested stack y la key pair `DemoKeyPair`, que la
+crea la propia plantilla) y vaciar y borrar el bucket `cf-templates-...-us-east-1`.
+
+---
+
+## DependsOn (lección 104)
+
+**`DependsOn`** fuerza que un recurso se cree **después** de otro.
+
+```yaml
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0a3c3a20c09d6f377
+      InstanceType: t2.micro
+
+  MyBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: EC2Instance
+```
+
+- Primero se crea la instancia y después el bucket. **Al borrar, el orden se invierte**: primero
+  el bucket y luego la instancia.
+- Con `!Ref` y `!GetAtt` la dependencia ya es **implícita** (lección 88). `DependsOn` es para
+  cuando la dependencia existe pero no aparece en la plantilla.
+- Se puede usar con cualquier recurso.
+- Caso típico: una instancia o una Elastic IP en una VPC que necesita el **Internet Gateway ya
+  asociado** (`AWS::EC2::VPCGatewayAttachment`). Nada los referencia entre sí, y sin `DependsOn`
+  CloudFormation puede intentar crearlos en paralelo y fallar.
+- En la plantilla del vídeo el recurso se llama `EC2Instance` pero el `DependsOn` apunta a
+  `MyEC2Instance`, que no existe: tal cual, CloudFormation la rechaza por dependencia sin resolver.
+
+**Práctica** (`5-dependson.yml`, `us-east-1`): solo comprobar el orden de creación en los eventos
+del stack.
+
+**Limpieza:** borrar el stack y el bucket `cf-templates-...-us-east-1`.
+
+---
+
+## StackSets: aviso de coste (lección 105)
+
+Stéphane recomienda **ver las prácticas de StackSets (107 a 109) sin hacerlas**. La demo activa
+**AWS Config** en varias regiones con un StackSet, y Config cobra por cada configuration item
+registrado y por cada evaluación de reglas. A él le costó más de 72 $ mientras grababa. Además, si
+al borrar se queda un recorder activo en alguna región, sigue cobrando sin que se vea en la región
+seleccionada.
+
+---
+
 ## Building blocks de una plantilla
 
 ### Componentes
@@ -1078,3 +1204,7 @@ trasladan casi directamente a Terraform.
 | `cfn-hup` | Detecta cambios en la `Metadata` y relanza `cfn-init` sin reemplazar la instancia |
 | `cfn-signal` + WaitCondition | `cfn-signal -e $?` informa del resultado. La `CreationPolicy` (`Timeout`, `Count`) bloquea hasta recibir las señales. También en EC2 y ASG |
 | WaitCondition sin señales | Helper scripts en la AMI, logs de `cfn-init`, desactivar rollback para ver los logs, salida a Internet (NAT o IGW) |
+| Nested stacks | `AWS::CloudFormation::Stack` + `TemplateURL`. Outputs con `!GetAtt <nested>.Outputs.<nombre>`. Se actualizan siempre desde el padre. Piden `CAPABILITY_AUTO_EXPAND` |
+| Cross vs nested | Cross: compartir un recurso (VPC) con `Export`/`ImportValue`, ciclos de vida separados. Nested: reutilizar una plantilla, cada padre su copia, ligada a él |
+| `DependsOn` | Fuerza el orden de creación (al borrar, al revés). Implícito con `!Ref`/`!GetAtt`. Típico: recursos que necesitan el `VPCGatewayAttachment` del IGW |
+| StackSets + Config | Prácticas solo vistas: Config en varias regiones cobra por configuration item y evaluación |

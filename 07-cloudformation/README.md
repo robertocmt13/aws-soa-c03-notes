@@ -2,14 +2,15 @@
 
 Notas de la Sección 7 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 79 a 105 completadas. La parte de repaso reutilizada del curso de
+> Sección en curso. Lecciones 79 a 110 completadas. La parte de repaso reutilizada del curso de
 > Developer (`[DVA]`, lecciones 79 a 98): qué es CloudFormation, ventajas, funcionamiento, formas de
 > desplegar plantillas, componentes de una plantilla, prácticas de Create, Update y Delete Stack,
 > YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con exports, `Conditions`, funciones
 > intrínsecas, rollbacks, service role, capabilities, políticas de borrado y reemplazo, stack
 > policy, termination protection, custom resources y dynamic references. Y las primeras lecciones
 > específicas de CloudOps (99 a 105): user data, `cfn-init`, `cfn-signal` con wait conditions y
-> sus fallos, nested stacks, `DependsOn` y el aviso de coste de StackSets.
+> sus fallos, nested stacks, `DependsOn`, el aviso de coste de StackSets, StackSets (con las
+> prácticas 107 a 109 vistas sin desplegar) y Drift.
 
 ---
 
@@ -1101,6 +1102,210 @@ seleccionada.
 
 ---
 
+## StackSets (lección 106)
+
+Permiten **crear, actualizar o borrar stacks en varias cuentas y regiones** con una sola operación
+y una sola plantilla.
+
+- Se crean desde una **cuenta administradora**.
+- Cada destino (una cuenta en una región) recibe una **stack instance**. Por debajo es un stack
+  normal, como los de las prácticas anteriores.
+- **Al actualizar el StackSet se actualizan todas sus stack instances**, en todas las cuentas y
+  regiones.
+- Se pueden aplicar a **todas las cuentas de una AWS Organization**.
+
+> **Cuenta no es usuario.** Al principio me lié: una **cuenta** de AWS es el contenedor entero, con
+> su ID de 12 dígitos, su factura y sus recursos. `roberto-admin` es un **usuario de IAM dentro** de
+> mi cuenta, y root es el usuario raíz de esa misma cuenta, no otra. Los StackSets despliegan en
+> **cuentas**, no en usuarios: crear un usuario de IAM no hace que reciba nada del StackSet.
+
+### Modelos de permisos
+
+| | Self-managed | Service-managed |
+|---|---|---|
+| Roles | Los creo yo: `AWSCloudFormationStackSetAdministrationRole` en la cuenta administradora y `AWSCloudFormationStackSetExecutionRole` en cada cuenta destino, con la trust relationship entre ambos | Los crea StackSets por mí, habilitando el **trusted access** con AWS Organizations |
+| Destinos | Cualquier cuenta en la que pueda crear el rol de IAM | Cuentas gestionadas por AWS Organizations, eligiendo **OUs** |
+| Requisito | — | Organizations con **all features** activado (no solo *consolidated billing*) |
+| Cuentas nuevas | Hay que añadirlas a mano | **Automatic deployments**: las cuentas que entren en la organización en el futuro reciben su stack instance |
+
+- **El execution role va por cuenta, no por región.** IAM es global: un rol creado una vez en la
+  cuenta destino vale para desplegar en todas sus regiones.
+- El execution role **no se le asigna a ningún usuario**: lo asume CloudFormation dentro de la
+  cuenta destino, como el service role de la lección 90.
+- El **trusted access** no es algo de mi cuenta, es un ajuste de la **organización**: le da permiso
+  al servicio CloudFormation StackSets para crear él los roles en las cuentas miembro.
+
+### StackSets con AWS Organizations
+
+- **Despliegue automático** de stack instances en las cuentas nuevas de una organización.
+- La administración de StackSets se puede **delegar en una cuenta miembro** (*delegated
+  administrator*), para no trabajar desde la management account.
+- **El trusted access tiene que estar habilitado antes** de que los administradores delegados
+  puedan desplegar en cuentas gestionadas por Organizations.
+
+En el diagrama del curso, el StackSet de la cuenta administradora (delegada) apunta a **OUs**, no a
+cuentas sueltas: una OU de Prod y otra de Dev. Cuando se crea una cuenta nueva en la OU de Dev,
+recibe su stack instance sin tocar el StackSet.
+
+### Ejemplo propio: dos e-commerce idénticos en cuentas separadas
+
+Dos tiendas con la misma infraestructura, cada una en su cuenta (una vende zapatos y la otra
+calcetines):
+
+- **La misma plantilla** despliega el stack completo en las dos cuentas.
+- Lo que cambia entre ellas (dominio, nombre, tamaño de instancia) se resuelve con **parameter
+  overrides** por stack instance: misma plantilla, valores distintos en cada destino.
+- **Las dos tiendas quedan atadas**: un cambio en el StackSet llega a las dos, y un cambio malo las
+  rompe a las dos. Para limitarlo, *maximum concurrent accounts* a 1 y *failure tolerance* a 0: se
+  actualiza primero una cuenta y, si falla, la operación se para antes de tocar la segunda.
+
+---
+
+## Prácticas de StackSets (lecciones 107 a 109)
+
+Solo vistas, sin desplegar, por el coste de AWS Config (lección 105). La demo usa una sola cuenta
+como administradora y destino a la vez, con el modelo **self-managed**, y activa AWS Config en
+varias regiones.
+
+### Los dos roles (lección 107)
+
+Se crean con **dos stacks normales** antes del StackSet, con las plantillas
+`AWSCloudFormationStackSetAdministrationRole.yml` y `AWSCloudFormationStackSetExecutionRole.yml`.
+Como llevan `RoleName` fijo, piden `CAPABILITY_NAMED_IAM` (lección 91).
+
+```yaml
+Parameters:
+  AdministratorAccountId:
+    Type: String
+    Description: AWS Account Id of the administrator account
+      (the account in which StackSets will be created).
+    MaxLength: 12
+    MinLength: 12
+
+Resources:
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSCloudFormationStackSetExecutionRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Ref AdministratorAccountId
+            Action:
+              - sts:AssumeRole
+```
+
+- **Rol de administración**: su trust relationship confía en el **servicio**
+  `cloudformation.amazonaws.com`.
+- **Execution role**: confía en la **cuenta administradora**, que llega por el parámetro
+  `AdministratorAccountId` (12 caracteres exactos). Con una sola cuenta, se pone el propio ID y la
+  cuenta confía en sí misma.
+- La cadena: CloudFormation asume el rol de administración, y ese rol asume el execution role en
+  la cuenta destino.
+- En la demo el execution role lleva `AdministratorAccess` para simplificar. En producción, solo
+  los permisos que necesiten las plantillas que se despliegan.
+
+### La plantilla `enable-aws-config.yaml`
+
+Cosas que se ven en ella y ya conocía de lecciones anteriores:
+
+- Un `Mappings` (`FrequencyMap`) que traduce valores como `1hour` o `24hours` a los que espera
+  Config (`One_Hour`, `TwentyFour_Hours`).
+- `Conditions` combinadas con `!And`, `!Not` y `!Equals`: por ejemplo, crear la suscripción del
+  topic de SNS solo si se ha indicado un email.
+- **`DependsOn: ConfigBucketPolicy`** en el `ConfigRecorder`: el recorder necesita que la bucket
+  policy ya exista para poder escribir en el bucket, pero nada en sus propiedades la referencia. Es
+  el caso de la lección 104.
+- `DeletionPolicy: Retain` en el bucket de Config: al borrar el stack, el bucket se queda y hay que
+  borrarlo a mano (lección 92).
+
+### Crear el StackSet
+
+- **Configure StackSet options → Permissions**: se elige el rol de administración (*IAM admin role
+  ARN*) y se indica el nombre del execution role.
+- **Set deployment options**: desplegar en **cuentas** (números de cuenta separados por comas o un
+  fichero `.csv`) o en **unidades organizativas**. Después, las **regiones**, que se despliegan en
+  el orden indicado.
+- Con una sola cuenta, el destino es la propia cuenta, en varias **regiones**. Los StackSets
+  trabajan por cuenta y región: las AZs no aparecen en ningún momento.
+
+### Añadir regiones y borrar (lecciones 108 y 109)
+
+- En la 108 se añade una **stack instance** nueva en Londres (*Add stacks to StackSet*). Es distinto
+  de **actualizar el StackSet** (cambiar plantilla o parámetros), que se propaga a todas las stack
+  instances existentes.
+- Para borrar: primero se quitan las stack instances (*Delete stacks from StackSet*), con la opción
+  de **conservar los stacks** en las cuentas destino. Dejan de estar gestionados por el StackSet,
+  pero los recursos siguen ahí. **El StackSet solo se puede borrar cuando está vacío.**
+
+---
+
+## Drift (lección 110)
+
+CloudFormation crea la infraestructura, pero **no protege frente a cambios manuales**. Si alguien
+cambia una regla de un security group desde la consola de EC2, el recurso ya no coincide con la
+plantilla: ha sufrido **drift**.
+
+**CloudFormation Drift** compara la configuración actual de los recursos con la esperada según la
+plantilla:
+
+- Sobre el **stack entero** (*Detect stack drift*) o sobre **recursos concretos** (*Detect drift
+  for resource*).
+- **No todos los tipos de recurso admiten detección de drift**: la consola solo lista los que la
+  soportan.
+- La detección **se lanza a mano**: el resultado es una foto del momento (*Last drift check time*).
+  Si se vuelve a cambiar algo, hay que lanzarla otra vez.
+
+| Nivel | Estados |
+|---|---|
+| Stack | `DRIFTED` / `IN_SYNC` |
+| Recurso | `MODIFIED` / `IN_SYNC` (también `DELETED` si se borró el recurso a mano) |
+| Propiedad | `NOT_EQUAL` (valor cambiado), `ADD` (añadido), `REMOVE` (quitado) |
+
+### Drift en StackSets
+
+- La detección se hace sobre el stack de **cada stack instance**.
+- Si un recurso difiere de lo esperado, se marca como drifted **el stack**, **la stack instance** y
+  **el StackSet**.
+- Solo detecta **cambios hechos fuera de CloudFormation** (consola, CLI, API del recurso). **Un
+  cambio hecho con CloudFormation directamente sobre el stack de una cuenta, y no a nivel de
+  StackSet, no cuenta como drift**: queda invisible para el StackSet. Por eso un StackSet se gestiona
+  siempre desde el propio StackSet, igual para todas las cuentas y regiones.
+- La detección de drift de un StackSet se puede **detener**.
+
+### Práctica
+
+La plantilla `3-drift-security-group.yaml` del vídeo no venía en el material del curso, así que la
+reconstruí a partir de lo que se ve en pantalla: dos security groups (SSH desde `10.0.0.0/25` y
+HTTP desde `0.0.0.0/0`) con un parámetro `VPCId` de tipo `AWS::EC2::VPC::Id`, que en la consola
+sale como desplegable con las VPCs reales de la región (lección 84).
+
+Stack `DemoDriftSG` en `us-east-1`, y cambios a mano desde la consola de EC2:
+
+- En el security group HTTP, el origen de `0.0.0.0/0` a `0.0.0.0/16`, y una regla nueva de HTTPS
+  (443).
+- También una modificación en el de SSH.
+
+Resultado: stack `DRIFTED` y los dos recursos `MODIFIED`. En *View drift details* del HTTP salen
+las dos diferencias, `SecurityGroupIngress.0.CidrIp` como `NOT_EQUAL` y `SecurityGroupIngress.1`
+como `ADD`, con el JSON *Expected* frente al *Actual*.
+
+- Después de borrar el stack, la página de drift seguía mostrando el último resultado. Es el
+  historial del stack borrado (lección 89), abierto con la URL que lleva su ID: no queda nada vivo.
+- **Novedad de la consola**: *Create a drift-aware change set*, que devuelve los recursos al estado
+  de la plantilla. En el vídeo (2021) no existe.
+- El editor visual de la consola de CloudFormation ahora se llama **Template studio**: es lo que
+  queda tras la retirada de la consola independiente de Infrastructure Composer.
+
+**Coste:** cero, solo security groups. **Limpieza:** borrar el stack (la regla 443 añadida a mano se
+va con el security group), comprobar en EC2 que solo queda el security group `default`, y vaciar y
+borrar el bucket `cf-templates-...-us-east-1`.
+
+---
+
 ## Building blocks de una plantilla
 
 ### Componentes
@@ -1208,3 +1413,11 @@ trasladan casi directamente a Terraform.
 | Cross vs nested | Cross: compartir un recurso (VPC) con `Export`/`ImportValue`, ciclos de vida separados. Nested: reutilizar una plantilla, cada padre su copia, ligada a él |
 | `DependsOn` | Fuerza el orden de creación (al borrar, al revés). Implícito con `!Ref`/`!GetAtt`. Típico: recursos que necesitan el `VPCGatewayAttachment` del IGW |
 | StackSets + Config | Prácticas solo vistas: Config en varias regiones cobra por configuration item y evaluación |
+| StackSets | Misma plantilla en varias **cuentas y regiones** con una operación. Cuenta administradora + stack instances. Actualizar el StackSet actualiza todas las instancias |
+| Self-managed | `AWSCloudFormationStackSetAdministrationRole` (admin) + `AWSCloudFormationStackSetExecutionRole` (una vez por cuenta destino, vale para todas sus regiones) |
+| Service-managed | AWS Organizations con **all features** + **trusted access**. Destinos por OU. Automatic deployments a cuentas nuevas |
+| Delegated administrator | Cuenta miembro que administra StackSets. Requiere trusted access habilitado antes |
+| Borrar un StackSet | Primero quitar las stack instances (opción de conservar los stacks). Solo se borra vacío |
+| Drift | Compara recursos con la plantilla. Stack entero o por recurso. Manual. No todos los recursos lo soportan |
+| Estados de drift | Stack `DRIFTED`/`IN_SYNC`; recurso `MODIFIED`/`DELETED`/`IN_SYNC`; propiedad `NOT_EQUAL`/`ADD`/`REMOVE` |
+| Drift en StackSets | Stack, stack instance y StackSet marcados como drifted. Solo cambios **fuera** de CloudFormation: un update directo al stack de una cuenta no cuenta |

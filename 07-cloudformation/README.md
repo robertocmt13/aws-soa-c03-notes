@@ -2,15 +2,16 @@
 
 Notas de la Sección 7 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> Sección en curso. Lecciones 79 a 110 completadas. La parte de repaso reutilizada del curso de
-> Developer (`[DVA]`, lecciones 79 a 98): qué es CloudFormation, ventajas, funcionamiento, formas de
-> desplegar plantillas, componentes de una plantilla, prácticas de Create, Update y Delete Stack,
-> YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con exports, `Conditions`, funciones
-> intrínsecas, rollbacks, service role, capabilities, políticas de borrado y reemplazo, stack
-> policy, termination protection, custom resources y dynamic references. Y las primeras lecciones
-> específicas de CloudOps (99 a 105): user data, `cfn-init`, `cfn-signal` con wait conditions y
-> sus fallos, nested stacks, `DependsOn`, el aviso de coste de StackSets, StackSets (con las
-> prácticas 107 a 109 vistas sin desplegar) y Drift.
+> **Sección completada.** Lecciones 79 a 114 y cuestionario final (10/13). La parte de repaso
+> reutilizada del curso de Developer (`[DVA]`, lecciones 79 a 98): qué es CloudFormation, ventajas,
+> funcionamiento, formas de desplegar plantillas, componentes de una plantilla, prácticas de Create,
+> Update y Delete Stack, YAML, `Resources`, `Parameters`, `Mappings`, `Outputs` con exports,
+> `Conditions`, funciones intrínsecas, rollbacks, service role, capabilities, políticas de borrado
+> y reemplazo, stack policy, termination protection, custom resources y dynamic references. Y las
+> lecciones específicas de CloudOps (99 a 114): user data, `cfn-init`, `cfn-signal` con wait
+> conditions y sus fallos, nested stacks, `DependsOn`, StackSets (con las prácticas 107 a 109
+> vistas sin desplegar por el coste de AWS Config), Drift, troubleshooting, comportamiento ante
+> fallos de creación, stack-level tags y `UpdatePolicy` de los ASG.
 
 ---
 
@@ -1306,6 +1307,176 @@ borrar el bucket `cf-templates-...-us-east-1`.
 
 ---
 
+## Troubleshooting (lección 111)
+
+Amplía lo de la lección 89 (Rollbacks): qué hacer cuando un stack o un StackSet se queda en un
+estado de error.
+
+### `DELETE_FAILED`
+
+El stack no se puede borrar porque algún recurso se resiste:
+
+- **Recursos que hay que vaciar antes de borrar**, como los buckets de S3 con objetos. Se pueden
+  vaciar a mano o automatizarlo con un **custom resource con Lambda** (lección 96).
+- **Un security group no se puede borrar mientras haya instancias EC2 que lo usen.**
+- Si el recurso debe sobrevivir al borrado, **`DeletionPolicy: Retain`** hace que CloudFormation se
+  lo salte (lección 92).
+
+### `UPDATE_ROLLBACK_FAILED`
+
+Un update falla, CloudFormation intenta volver atrás y **el rollback también falla**. El stack queda
+bloqueado y no admite más updates. Causas típicas:
+
+- **Recursos cambiados fuera de CloudFormation**: el drift de la lección 110.
+- **Permisos insuficientes**.
+- **Un ASG que no recibe suficientes señales** (`cfn-signal`, lecciones 101 y 102).
+
+Solución: **arreglar el error a mano y lanzar `ContinueUpdateRollback`**.
+
+### StackSets: stack instance en `OUTDATED`
+
+Una operación del StackSet falló en alguna cuenta destino. Causas:
+
+- **Permisos insuficientes en la cuenta destino** para crear los recursos de la plantilla.
+- **Recursos globales que tienen que ser únicos y no lo son**, como un bucket de S3 con el mismo
+  nombre en todas las cuentas: el segundo despliegue choca con el primero.
+- **La cuenta administradora no tiene trust relationship con la cuenta destino**: los roles de la
+  lección 107.
+- **Límite o cuota alcanzada** en la cuenta destino (demasiados recursos).
+
+### Otros dos casos
+
+**Lo que no se puede configurar desde la consola, tampoco desde la plantilla.** Ejemplo: no se puede
+fijar el nombre DNS privado de una EC2, porque no existe la propiedad `PrivateDnsName`.
+
+**La plantilla funciona en una región y no en otra.** Hay que revisar:
+
+- Que **los servicios de la plantilla estén disponibles** en esa región.
+- **Los IDs de AMI**, que son regionales (de ahí los `Mappings` por región de la lección 85).
+- **Valores escritos a mano que dependen de la región**, como los ARNs. Se evitan con pseudo
+  parámetros: `arn:${AWS::Partition}:...` en vez de `arn:aws:...`.
+- **Nombres que tienen que ser únicos**: los de bucket de S3 lo son a nivel global.
+
+---
+
+## Stack Failures (lección 112)
+
+El comportamiento al fallar la **creación** de un stack se puede elegir con `--on-failure`:
+
+| Opción | Qué hace |
+|---|---|
+| `ROLLBACK` (por defecto) | Borra los recursos creados hasta el momento. El stack queda en `ROLLBACK_COMPLETE` |
+| `DO_NOTHING` | Conserva todos los recursos creados. El stack queda en `CREATE_FAILED` |
+| `DELETE` | Borra todos los recursos **y el stack** |
+
+```bash
+aws cloudformation create-stack --stack-name MyTestStack \
+  --template-body file://template.yaml --on-failure DO_NOTHING
+```
+
+- **`DO_NOTHING` sirve para depurar**: los recursos no desaparecen antes de poder investigar. Es lo
+  que permitía entrar en la instancia a leer `/var/log/cfn-init.log` en las prácticas de
+  `cfn-signal`. En la consola es *Stack failure options → Preserve successfully provisioned
+  resources*. Equivale a `--disable-rollback`.
+- **Los recursos conservados siguen facturando**: hay que borrar el stack a mano al terminar.
+- **`DELETE` se ahorra el paso de `ROLLBACK_COMPLETE`**, ese estado en el que el stack ya no tiene
+  recursos pero sigue existiendo y solo se puede borrar.
+
+---
+
+## Stack-level Tags (lección 113)
+
+- Son **tags asociados al stack**, y CloudFormation los **propaga automáticamente a los recursos
+  del stack que los soportan** (no todos los tipos de recurso admiten tags).
+- Se ponen al crear o actualizar el stack, sin tocar la plantilla: en la consola, en *Configure
+  stack options → Tags*, y en la CLI con `--tags`:
+
+```bash
+aws cloudformation create-stack --stack-name DemoStack \
+  --template-body file://demo-template.yaml \
+  --tags Key=Environment,Value=Development Key=Project,Value=MyProject
+```
+
+- Facilitan encontrar todos los recursos de un stack con una búsqueda por tags.
+- Son distintos de los tags automáticos `aws:cloudformation:*` de la lección 80, que pone
+  CloudFormation por su cuenta.
+
+---
+
+## ASG Update Policy (lección 114)
+
+El atributo `UpdatePolicy` de un Auto Scaling Group indica a CloudFormation **cómo actualizar las
+instancias del ASG** cuando cambia algo que les afecta, por ejemplo la AMI.
+
+### `AutoScalingRollingUpdate`
+
+Actualiza las instancias **por tandas o todas a la vez, dentro del mismo ASG**.
+
+```yaml
+Resources:
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: 1
+      MaxSize: 4
+      DesiredCapacity: 1
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 2
+        MinInstancesInService: 1
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+```
+
+| Propiedad | Para qué sirve |
+|---|---|
+| `MaxBatchSize` | Cuántas instancias se reemplazan a la vez |
+| `MinInstancesInService` | Cuántas tienen que seguir en servicio durante el update |
+| `MinSuccessfulInstancesPercent` | Porcentaje de instancias que tienen que señalizar éxito |
+| `PauseTime` | Espera entre tandas (formato ISO 8601, como el `Timeout` de `cfn-signal`) |
+| `SuspendedProcesses` | Procesos del ASG que se suspenden durante el update |
+| `WaitOnResourceSignals` | Espera el `cfn-signal` de cada instancia nueva antes de seguir |
+
+### `AutoScalingReplacingUpdate`
+
+```yaml
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+```
+
+- **No reemplaza instancias: crea un ASG nuevo** para sustituir al viejo.
+- **Hay que tener capacidad de EC2 suficiente para dos ASGs** a la vez.
+- **Si el update falla, se borra el ASG nuevo y el viejo queda intacto.**
+- Se combina con un `CreationPolicy` (`ResourceSignal` con `Count` y `Timeout`, y
+  `AutoScalingCreationPolicy` con `MinSuccessfulInstancesPercent`) para decidir cuándo el ASG nuevo
+  se da por bueno.
+
+---
+
+## Cuestionario de la sección
+
+**10 de 13.** Uno de los fallos lo contó mal Udemy (marqué la respuesta correcta y no la
+registró), así que los que cuentan son tres:
+
+- **ELB reutilizable por otros equipos**: la respuesta era subir la plantilla a S3 y usarla como
+  **nested stack** (lección 103). Lo sabía, pero leí mal la pregunta en inglés. La pista estaba en
+  *"re-used by the teams"*.
+- **Pseudo parámetro que NO es válido**: `AWS::AccountName`, que no existe. Marqué `AWS::AccountId`
+  sin fijarme en el **NOT**. Los válidos: `AWS::AccountId`, `AWS::Region`, `AWS::StackId`,
+  `AWS::StackName`, `AWS::NoValue`, `AWS::Partition`, `AWS::URLSuffix` y `AWS::NotificationARNs`.
+- **Que los desarrolladores creen y actualicen stacks sin permisos sobre los recursos**: es el
+  **service role** (lección 90), no la stack policy. La stack policy protege recursos frente a
+  updates, igual para todo el mundo; la pregunta iba de qué pueden hacer los usuarios.
+
+La pregunta que contó mal Udemy era la de un stack en `ROLLBACK_COMPLETE` tras su primera creación:
+la respuesta es borrarlo y crearlo de nuevo.
+
+**Lección para el examen:** localizar la palabra clave de la pregunta (*re-used*, **NOT**,
+*without giving permissions*) antes de mirar las opciones.
+
+---
+
 ## Building blocks de una plantilla
 
 ### Componentes
@@ -1421,3 +1592,11 @@ trasladan casi directamente a Terraform.
 | Drift | Compara recursos con la plantilla. Stack entero o por recurso. Manual. No todos los recursos lo soportan |
 | Estados de drift | Stack `DRIFTED`/`IN_SYNC`; recurso `MODIFIED`/`DELETED`/`IN_SYNC`; propiedad `NOT_EQUAL`/`ADD`/`REMOVE` |
 | Drift en StackSets | Stack, stack instance y StackSet marcados como drifted. Solo cambios **fuera** de CloudFormation: un update directo al stack de una cuenta no cuenta |
+| `DELETE_FAILED` | Bucket S3 con objetos (vaciar o custom resource con Lambda), security group en uso por instancias EC2, o `DeletionPolicy: Retain` para saltarlo |
+| `UPDATE_ROLLBACK_FAILED` | Recursos cambiados fuera de CloudFormation, permisos, ASG sin señales. Arreglar a mano + `ContinueUpdateRollback` |
+| Stack instance `OUTDATED` | Permisos en la cuenta destino, recurso global con nombre repetido, sin trust relationship, cuota alcanzada |
+| Funciona en una región y no en otra | Disponibilidad del servicio, AMIs regionales, ARNs a mano (usar `AWS::Partition`), nombres únicos globales |
+| `--on-failure` | `ROLLBACK` (por defecto), `DO_NOTHING` (conservar para depurar, `CREATE_FAILED`), `DELETE` (borra recursos y stack) |
+| Stack-level tags | Se propagan a los recursos del stack que admiten tags. Consola o `--tags` |
+| `AutoScalingRollingUpdate` | Instancias por tandas en el mismo ASG: `MaxBatchSize`, `MinInstancesInService`, `PauseTime`, `WaitOnResourceSignals` |
+| `AutoScalingReplacingUpdate` | `WillReplace: true`: ASG nuevo; capacidad para dos ASGs; si falla, se borra el nuevo y queda el viejo |

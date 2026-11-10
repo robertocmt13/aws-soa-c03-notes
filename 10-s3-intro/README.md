@@ -2,9 +2,10 @@
 
 Notas de la Sección 10 del curso de AWS Certified CloudOps Engineer Associate (SOA-C03).
 
-> **Sección en curso.** Lecciones 130 a 137: buckets y objetos, namespaces de nombres, multipart
-> upload, primer bucket, seguridad con IAM y bucket policies, Block Public Access, condiciones
-> avanzadas, versionado y su troubleshooting. Pendientes: replicación (138 a 142) y cuestionario.
+> **Sección completada.** Lecciones 130 a 142 y cuestionario final (5/5): buckets y objetos,
+> namespaces de nombres, multipart upload, seguridad con IAM y bucket policies, Block Public
+> Access, condiciones avanzadas, versionado y su troubleshooting, replicación CRR/SRR,
+> replicación cross-account y Replication Time Control.
 
 ---
 
@@ -310,6 +311,151 @@ Documentación: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/versionin
 
 ---
 
+## Replicación: CRR y SRR (lección 138)
+
+| | CRR (Cross-Region Replication) | SRR (Same-Region Replication) |
+|---|---|---|
+| Destino | Otra región | La misma región |
+| Casos de uso | Cumplimiento normativo, menos latencia para usuarios de otra región, copia en otra cuenta | Agregar logs de varios buckets en uno, copia en vivo de producción a una cuenta de test |
+
+- **El versionado tiene que estar activado en los dos buckets**, origen y destino.
+- Los buckets pueden estar **en cuentas distintas**.
+- **La copia es asíncrona**: el destino puede ir unos segundos o minutos por detrás. Se parece más
+  a un `rsync` periódico que a un RAID 1. Para un tiempo garantizado está RTC (lección 142).
+- Hace falta un **rol IAM** que permita a S3 leer del origen y escribir en el destino.
+
+---
+
+## Replicación: qué se replica y qué no (lección 139)
+
+- **Solo se replican los objetos nuevos**, los subidos después de crear la regla.
+- Los objetos que ya existían, y los que fallaron al replicarse, se copian con **S3 Batch
+  Replication**.
+- **Borrados:**
+  - Los **delete markers** se replican **solo si se activa esa opción** en la regla.
+  - Los **borrados de una versión concreta no se replican nunca**, para que un borrado malicioso o
+    accidental en el origen no se lleve también la copia del destino.
+- **No hay encadenamiento (*chaining*).** Con dos reglas, bucket 1 → bucket 2 y bucket 2 →
+  bucket 3, lo que se sube al bucket 1 llega al 2 pero **no al 3**:
+
+  | Objeto | ¿Llega al bucket 2? | ¿Llega al bucket 3? |
+  |---|---|---|
+  | Subido al bucket 1 | Sí | **No** |
+  | Subido directamente al bucket 2 | — | Sí |
+
+  La regla del bucket 2 solo replica lo que se escribe directamente en él, no las réplicas que le
+  llegan. Para llevar lo del bucket 1 al 3 hace falta una regla directa **1 → 3** (un bucket
+  puede tener varias reglas hacia destinos distintos).
+
+> Esto no lo entendí a la primera. La analogía que me sirvió: una réplica intermedia de MySQL sin
+> `log_slave_updates` aplica lo que le llega del maestro, pero no lo escribe en su binlog, así
+> que la réplica que cuelga de ella no lo recibe.
+
+---
+
+## Práctica: replicación entre regiones (lección 140)
+
+**No necesita EC2.**
+
+1. Crear el bucket de origen `s3-robertomoyano-bucket-origin-v2` en **`eu-west-1`** con
+   versionado.
+2. Crear el bucket de destino `s3-robertomoyano-bucket-replica-v2` en **`us-east-1`** con
+   versionado.
+3. En el origen, *Management → Replication rules → Create replication rule* (`DemoReplicationRule`),
+   para todo el bucket, con destino el bucket de réplica. La consola **crea el rol IAM** sola.
+4. Al guardar la regla, la consola pregunta **Replicate existing objects?** y ofrece lanzar un
+   trabajo de **Batch Operations**: es S3 Batch Replication. Lo dejé en *No* (cuesta aparte).
+5. Subir un objeto al origen y comprobar con **Show versions** que aparece en la réplica.
+6. Activar **delete marker replication**, borrar el objeto en el origen sin indicar versión y
+   comprobar que el delete marker aparece también en la réplica.
+
+### Lo que se ve en la práctica
+
+- **El version ID es el mismo en los dos buckets.** La replicación no crea una versión nueva en
+  el destino: copia el objeto con su misma versión.
+- Tras el borrado, el objeto "desaparece" de los dos buckets, pero con *Show versions* se ve el
+  delete marker y la versión sigue ahí. Si se borra **la versión concreta** en el origen, ese
+  borrado no llega a la réplica.
+- La tabla de reglas muestra las opciones de la regla: prioridad, alcance, storage class, dueño de
+  la réplica (*Replica owner*), RTC y sincronización de cambios en la réplica.
+
+### Coste y limpieza
+
+1. **Empty** y **Delete** de **los dos** buckets (la regla se va con el bucket de origen).
+2. **IAM → Roles:** borrar el rol `s3crr_role_for_s3-robertomoyano-bucket-origin-v2`. **No se
+   borra con los buckets.**
+3. No tocar los roles `AWSServiceRoleFor...`: son *service-linked roles* que crea y usa cada
+   servicio.
+
+---
+
+## Replicación entre cuentas (lección 141)
+
+**Por defecto, el dueño del objeto en el origen es también el dueño de la réplica.** Si se
+replica de la cuenta A a un bucket de la cuenta B, las réplicas siguen siendo de A aunque estén en
+el bucket de B, y B puede no tener permiso para leerlas o gestionarlas en su propio bucket.
+
+Para que las réplicas pasen a ser de la cuenta de destino (**owner override**):
+
+1. Activar la opción **owner override** en la regla de replicación.
+2. En la **cuenta de origen**: el rol IAM de replicación necesita
+   `s3:ObjectOwnerOverrideToBucketOwner` sobre `arn:aws:s3:::dest-bucket/*`.
+3. En la **cuenta de destino**: la bucket policy permite esa misma acción a la cuenta de origen.
+
+Es la regla del acceso entre cuentas de la lección 132: **permiso en los dos lados** (IAM en el
+origen y bucket policy en el destino). Esto aplica también a la replicación cross-account normal:
+el bucket de destino tiene que permitir que el rol del origen le escriba.
+
+> Si el bucket de destino tiene **ACLs disabled** (*Bucket owner enforced*, lo que viene por
+> defecto), el dueño del bucket es dueño de todo lo que entra, réplicas incluidas, y el problema
+> desaparece. Lo de la diapositiva sigue cayendo en el examen.
+
+Sin práctica: necesita dos cuentas.
+
+---
+
+## Replication Time Control (lección 142)
+
+- Garantiza la velocidad de replicación: **el 99,99 % de los objetos nuevos se replica en menos
+  de 15 minutos**. Tiempo predecible y auditable.
+- Funciona en la misma región o entre regiones.
+- **Coste adicional por GB replicado**: solo cuando hay un requisito de negocio o de cumplimiento.
+- Pista de examen: "replicación con tiempo **garantizado** / SLA / auditable" → **RTC**.
+
+### Monitorización
+
+RTC publica en **CloudWatch** las métricas de replicación:
+
+| Métrica | Qué mide |
+|---|---|
+| `ReplicationLatency` | Cuánto va por detrás el destino |
+| `BytesPendingReplication` / `OperationsPendingReplication` | Lo que queda por replicar |
+| `OperationsFailedReplication` | Lo que ha fallado (se puede reintentar con Batch Replication) |
+
+Además, S3 genera un evento cuando un objeto supera los 15 minutos
+(`s3:Replication:OperationMissedThreshold`). Con eso y alarmas sobre las métricas se detecta que la
+replicación se ha atascado.
+
+> No confundir los dos "15 minutos" de la sección: **RTC replica en menos de 15 minutos**; con el
+> **versionado** hay que **esperar 15 minutos después de activarlo** antes de escribir.
+
+---
+
+## Cuestionario de la sección
+
+**5 de 5.** Preguntas sobre:
+
+- Un bucket de origen A y dos de destino B y C: **una regla de replicación desde A hacia cada
+  destino**, no encadenadas.
+- Qué hacer antes de activar la replicación entre dos buckets: **activar el versionado en los
+  dos**.
+- Tener el contenido de un bucket disponible en varias regiones: **CRR**.
+- Versión de los objetos que ya existían al activar el versionado: **`null`**.
+- Error al crear un bucket llamado `dev`: **los nombres de bucket son globalmente únicos** y ese
+  ya lo tiene otra cuenta.
+
+---
+
 ## Resumen para el examen
 
 | Concepto | Clave |
@@ -335,3 +481,10 @@ Documentación: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/versionin
 | Delete marker | Borrar sin versión → marker. Recuperar = borrar el marker. Borrar versión concreta = permanente |
 | Coste del versionado | Cada versión se factura entera |
 | 404 NoSuchKey tras activar el versionado | Esperar 15 minutos antes de escribir |
+| Replicación (CRR / SRR) | Versionado en **los dos** buckets. Asíncrona. Rol IAM. Puede ser entre cuentas |
+| CRR / SRR, casos de uso | CRR: cumplimiento, latencia, otra cuenta. SRR: agregación de logs, producción → test |
+| Objetos que ya existían o que fallaron | **S3 Batch Replication** |
+| Borrados replicados | Delete markers: opcional. Borrado de versión concreta: **nunca** |
+| Chaining | **No hay**. 1 → 2 → 3 no lleva lo de 1 a 3: regla directa 1 → 3 |
+| Replicación cross-account | Réplicas del dueño del origen por defecto. **Owner override** + `s3:ObjectOwnerOverrideToBucketOwner` en el rol IAM del origen y en la bucket policy del destino |
+| Replicación con tiempo garantizado | **RTC**: 99,99 % en < 15 min, métricas en CloudWatch, coste extra |
